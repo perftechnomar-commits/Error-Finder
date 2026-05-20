@@ -573,6 +573,10 @@ def results_to_excel_bytes(results: Dict[str, pd.DataFrame]) -> bytes:
     output = BytesIO()
     sheet_map = {
         "portfolio_summary": "Summary",
+        "recent_errors": "Recent Errors",
+        "daily_kpis": "Daily KPIs",
+        "by_severity": "By Severity",
+        "status_summary": "Status Summary",
         "by_rule": "By Rule",
         "errors": "Errors",
         "checked_rows": "Checked Rows",
