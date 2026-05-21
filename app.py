@@ -445,7 +445,8 @@ if vessel_options:
     button_cols = st.columns(6)
     if button_cols[0].button("All vessels", use_container_width=True):
         st.session_state["selected_vessel_filter"] = "All vessels"
-    for idx, row in enumerate(vessel_summary.head(5).itertuples(index=False), start=1):
+    top_button_vessels = vessel_summary.sort_values("total_errors", ascending=False).head(5)
+    for idx, row in enumerate(top_button_vessels.itertuples(index=False), start=1):
         label = f"{str(row.Vessel)[:18]} ({int(row.total_errors)})"
         if button_cols[idx].button(label, use_container_width=True):
             st.session_state["selected_vessel_filter"] = str(row.Vessel)
@@ -490,10 +491,6 @@ cols[2].metric("Rows with errors", rows_with_errors)
 cols[3].metric("Rows OK", rows_ok)
 cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
-
-recent_label = ", ".join(str(d) for d in recent_dates) if recent_dates else "no report dates found"
-st.info(f"Recent problem table is based on the latest {int(recent_days)} report day(s): {recent_label}.")
-
 
 # -----------------------------------------------------------------------------
 # Tabs
