@@ -17,6 +17,7 @@ st.title("Noon Report Checker")
 st.caption("Upload ANTHEA-style noon report Excel files and run the adapted Error Finder validation rules.")
 
 API_VESSEL_FIELD = "ShipName"
+API_HEADERS = {"Accept": "application/json"}
 
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
@@ -142,14 +143,33 @@ def parse_odata_rows(payload: dict | list) -> list[dict]:
 
 def get_marorka_auth() -> HTTPBasicAuth | HTTPDigestAuth:
     """Build the API authentication object from Streamlit secrets."""
-    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "basic")).lower().strip()
+    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "digest")).lower().strip()
     username = st.secrets["MARORKA_USERNAME"]
     password = st.secrets["MARORKA_PASSWORD"]
 
-    if auth_method == "digest":
-        return HTTPDigestAuth(username, password)
+    if auth_method == "basic":
+        return HTTPBasicAuth(username, password)
 
-    return HTTPBasicAuth(username, password)
+    return HTTPDigestAuth(username, password)
+
+
+def read_odata_json(response: requests.Response, context: str) -> dict | list:
+    """Read JSON safely and return a useful error when the API returns HTML/XML/empty text."""
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        preview = response.text[:300].replace("\n", " ").strip()
+        raise RuntimeError(f"{context} failed with HTTP {response.status_code}. Response preview: {preview}") from exc
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        preview = response.text[:300].replace("\n", " ").strip()
+        content_type = response.headers.get("Content-Type", "unknown")
+        raise RuntimeError(
+            f"{context} did not return JSON. Content-Type: {content_type}. "
+            f"Response preview: {preview}. Check MARORKA_AUTH_METHOD, credentials, endpoint, and $format=json support."
+        ) from exc
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -172,17 +192,18 @@ def fetch_api_vessel_options_last_5_days(
         "$select": API_VESSEL_FIELD,
         "$orderby": API_VESSEL_FIELD,
         "$top": "5000",
+        "$format": "json",
     }
 
     response = requests.get(
         base_url,
         params=params,
         auth=get_marorka_auth(),
+        headers=API_HEADERS,
         timeout=60,
     )
-    response.raise_for_status()
 
-    rows = parse_odata_rows(response.json())
+    rows = parse_odata_rows(read_odata_json(response, "Vessel list request"))
     if not rows:
         return []
 
@@ -220,17 +241,18 @@ def fetch_api_noon_reports_last_5_days(
             f"and {API_VESSEL_FIELD} eq '{escaped_vessel}'"
         ),
         "$orderby": "StartDateTimeGMT desc",
+        "$format": "json",
     }
 
     response = requests.get(
         base_url,
         params=params,
         auth=get_marorka_auth(),
+        headers=API_HEADERS,
         timeout=60,
     )
-    response.raise_for_status()
 
-    rows = parse_odata_rows(response.json())
+    rows = parse_odata_rows(read_odata_json(response, "Report data request"))
     return pd.DataFrame(rows)
 
 
@@ -336,20 +358,31 @@ else:
         except Exception as exc:  # noqa: BLE001 - show user-facing API errors in Streamlit
             vessel_list_error = str(exc)
 
+    if vessel_options:
+        vessel_name = st.selectbox(
+            "Vessel",
+            options=vessel_options,
+            index=None,
+            placeholder="Search or select vessel",
+            help="Start typing to search. Full API data will load only after a vessel is selected and Refresh API data is pressed.",
+        )
+        vessel_name = vessel_name.strip() if vessel_name else ""
+    else:
+        vessel_name = st.text_input(
+            "Vessel",
+            placeholder="Type exact vessel name",
+            help="Fallback manual input appears only if the searchable API vessel list cannot be loaded.",
+        ).strip()
+
     if vessel_list_error:
-        st.warning(f"Could not load vessel list from API: {vessel_list_error}")
-
-    vessel_name = st.selectbox(
-        "Vessel",
-        options=vessel_options,
-        index=None,
-        placeholder="Search or select vessel",
-        help="Start typing to search. Full API data will load only after a vessel is selected and Refresh API data is pressed.",
-    )
-    vessel_name = vessel_name.strip() if vessel_name else ""
-
-    if not vessel_options and not vessel_list_error:
-        st.warning("No vessels found with reports during the latest 5 calendar days.")
+        with st.expander("Vessel list could not be loaded - details", expanded=False):
+            st.warning(vessel_list_error)
+            st.caption(
+                "You can still type the exact vessel name manually above and press Refresh API data. "
+                "The full API request will then check whether that vessel has reports in the latest 5 days."
+            )
+    elif not vessel_options:
+        st.info("No vessels found with reports during the latest 5 calendar days.")
 
     if st.button("Refresh vessel list", use_container_width=True):
         st.session_state["api_vessel_list_refresh_token"] += 1
@@ -369,7 +402,7 @@ else:
             st.stop()
 
         if not vessel_name:
-            st.warning("Please select/type a vessel before refreshing API data.")
+            st.warning("Please select or type a vessel before refreshing API data.")
             st.stop()
 
 
