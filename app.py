@@ -49,6 +49,23 @@ def filter_last_report_days(errors_df: pd.DataFrame, days: int = 2) -> tuple[pd.
     return recent, last_dates
 
 
+def get_latest_report_dates(df: pd.DataFrame, days: int) -> list:
+    """Return the latest N report dates from a dated dataframe."""
+    if df.empty or "report_date" not in df.columns:
+        return []
+    available_dates = sorted([d for d in df["report_date"].dropna().unique().tolist()])
+    return available_dates[-int(days):] if available_dates else []
+
+
+def filter_to_report_dates(df: pd.DataFrame, report_dates: list) -> pd.DataFrame:
+    """Filter a dated dataframe to selected report dates."""
+    if df.empty or "report_date" not in df.columns:
+        return df.copy()
+    if not report_dates:
+        return df.iloc[0:0].copy()
+    return df[df["report_date"].isin(report_dates)].copy()
+
+
 def build_daily_kpis(checked_rows: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
     """Build daily operational validation KPIs."""
     if checked_rows.empty or "start_gmt" not in checked_rows.columns:
@@ -252,12 +269,12 @@ with st.sidebar:
 
     config = DEFAULT_CONFIG.copy()
     recent_days = st.number_input(
-        "Recent problem table: last N report days",
+        "Dashboard report days to show",
         min_value=1,
         max_value=5,
         value=5,
         step=1,
-        help="Display filter only. The operational source is expected to cover the latest 5 report days.",
+        help="Display filter only. It scopes the dashboard to the latest N report dates from the loaded file and does not rerun validation.",
     )
 
     with st.expander("Validation rule scope", expanded=True):
@@ -383,9 +400,18 @@ checked_rows = combined["checked_rows"]
 by_rule = combined["by_rule"]
 skipped_rules = combined["skipped_rules"]
 
-recent_errors, recent_dates = filter_last_report_days(errors, int(recent_days))
-errors_dated = with_report_dates(errors) if not errors.empty else errors.copy()
-checked_rows_dated = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
+errors_dated_all = with_report_dates(errors) if not errors.empty else errors.copy()
+checked_rows_dated_all = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
+
+# Dashboard report-day scope. This is a display filter only; it does not rerun validation.
+# Dates are taken from checked rows first, so dates with zero errors are still respected.
+recent_dates = get_latest_report_dates(checked_rows_dated_all, int(recent_days))
+if not recent_dates:
+    recent_dates = get_latest_report_dates(errors_dated_all, int(recent_days))
+
+errors_dated = filter_to_report_dates(errors_dated_all, recent_dates)
+checked_rows_dated = filter_to_report_dates(checked_rows_dated_all, recent_dates)
+recent_errors = errors_dated.copy()
 
 
 # -----------------------------------------------------------------------------
@@ -484,7 +510,7 @@ cols[5].metric("Error row rate", f"{error_rate:.1%}")
 # -----------------------------------------------------------------------------
 
 fleet_tab, main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs(
-    ["Fleet overview", "All errors", f"Last {int(recent_days)} days", "KPI dashboard", "Checked rows", "Export / setup"]
+    ["Fleet overview", "All errors", f"Latest {int(recent_days)} report days", "KPI dashboard", "Checked rows", "Export / setup"]
 )
 
 with fleet_tab:
@@ -529,7 +555,7 @@ with main_tab:
         st.dataframe(by_rule_scope.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
 with recent_tab:
-    display_error_table(f"Problems in the latest {int(recent_days)} report day(s)", recent_errors_scope)
+    display_error_table(f"Problems in selected latest {int(recent_days)} report day(s)", recent_errors_scope)
 
     available_dates = sorted([d for d in errors_scope.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_scope.empty else []
     if available_dates:
@@ -602,7 +628,7 @@ with export_tab:
     )
 
     st.download_button(
-        f"Download last {int(recent_days)} days errors as CSV",
+        f"Download selected latest {int(recent_days)} report day errors as CSV",
         data=recent_errors_scope.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"noon_report_errors_last_{int(recent_days)}_days.csv",
         mime="text/csv",
