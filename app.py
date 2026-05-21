@@ -16,9 +16,6 @@ st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wi
 st.title("Noon Report Checker")
 st.caption("Upload ANTHEA-style noon report Excel files and run the adapted Error Finder validation rules.")
 
-API_VESSEL_FIELD = "ShipName"
-API_HEADERS = {"Accept": "application/json"}
-
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
     """Parse report datetimes robustly for filtering and KPI charts."""
@@ -143,87 +140,21 @@ def parse_odata_rows(payload: dict | list) -> list[dict]:
 
 def get_marorka_auth() -> HTTPBasicAuth | HTTPDigestAuth:
     """Build the API authentication object from Streamlit secrets."""
-    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "digest")).lower().strip()
+    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "basic")).lower().strip()
     username = st.secrets["MARORKA_USERNAME"]
     password = st.secrets["MARORKA_PASSWORD"]
 
-    if auth_method == "basic":
-        return HTTPBasicAuth(username, password)
+    if auth_method == "digest":
+        return HTTPDigestAuth(username, password)
 
-    return HTTPDigestAuth(username, password)
-
-
-def read_odata_json(response: requests.Response, context: str) -> dict | list:
-    """Read JSON safely and return a useful error when the API returns HTML/XML/empty text."""
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        preview = response.text[:300].replace("\n", " ").strip()
-        raise RuntimeError(f"{context} failed with HTTP {response.status_code}. Response preview: {preview}") from exc
-
-    try:
-        return response.json()
-    except ValueError as exc:
-        preview = response.text[:300].replace("\n", " ").strip()
-        content_type = response.headers.get("Content-Type", "unknown")
-        raise RuntimeError(
-            f"{context} did not return JSON. Content-Type: {content_type}. "
-            f"Response preview: {preview}. Check MARORKA_AUTH_METHOD, credentials, endpoint, and $format=json support."
-        ) from exc
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_api_vessel_options_last_5_days(
-    base_url: str,
-    today_date: date,
-    force_refresh_token: int = 0,
-) -> list[str]:
-    """Fetch unique vessel names from the latest 5 calendar days using only the vessel column."""
-    del force_refresh_token  # Used only to intentionally break cache when Refresh vessel list is pressed.
-
-    start_date = today_date - timedelta(days=4)
-    end_date = today_date + timedelta(days=1)
-
-    params = {
-        "$filter": (
-            f"StartDateTimeGMT ge DateTime'{start_date:%Y-%m-%d}' "
-            f"and StartDateTimeGMT lt DateTime'{end_date:%Y-%m-%d}'"
-        ),
-        "$select": API_VESSEL_FIELD,
-        "$orderby": API_VESSEL_FIELD,
-        "$top": "5000",
-        "$format": "json",
-    }
-
-    response = requests.get(
-        base_url,
-        params=params,
-        auth=get_marorka_auth(),
-        headers=API_HEADERS,
-        timeout=60,
-    )
-
-    rows = parse_odata_rows(read_odata_json(response, "Vessel list request"))
-    if not rows:
-        return []
-
-    df = pd.DataFrame(rows)
-    if API_VESSEL_FIELD not in df.columns:
-        return []
-
-    vessels = (
-        df[API_VESSEL_FIELD]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
-    return sorted(v for v in vessels.unique().tolist() if v)
+    return HTTPBasicAuth(username, password)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_api_noon_reports_last_5_days(
     base_url: str,
     vessel_name: str,
+    vessel_field: str,
     today_date: date,
     force_refresh_token: int = 0,
 ) -> pd.DataFrame:
@@ -238,21 +169,20 @@ def fetch_api_noon_reports_last_5_days(
         "$filter": (
             f"StartDateTimeGMT ge DateTime'{start_date:%Y-%m-%d}' "
             f"and StartDateTimeGMT lt DateTime'{end_date:%Y-%m-%d}' "
-            f"and {API_VESSEL_FIELD} eq '{escaped_vessel}'"
+            f"and {vessel_field} eq '{escaped_vessel}'"
         ),
         "$orderby": "StartDateTimeGMT desc",
-        "$format": "json",
     }
 
     response = requests.get(
         base_url,
         params=params,
         auth=get_marorka_auth(),
-        headers=API_HEADERS,
         timeout=60,
     )
+    response.raise_for_status()
 
-    rows = parse_odata_rows(read_odata_json(response, "Report data request"))
+    rows = parse_odata_rows(response.json())
     return pd.DataFrame(rows)
 
 
@@ -338,59 +268,27 @@ else:
         value="https://online.marorka.com/Odata/v1/ODataService.svc/ReportData",
     ).strip()
 
-    today_date = date.today()
-
-    if "api_force_refresh_token" not in st.session_state:
-        st.session_state["api_force_refresh_token"] = 0
-
-    if "api_vessel_list_refresh_token" not in st.session_state:
-        st.session_state["api_vessel_list_refresh_token"] = 0
-
-    vessel_options = []
-    vessel_list_error = None
-    if api_base_url:
-        try:
-            vessel_options = fetch_api_vessel_options_last_5_days(
-                api_base_url,
-                today_date,
-                st.session_state["api_vessel_list_refresh_token"],
-            )
-        except Exception as exc:  # noqa: BLE001 - show user-facing API errors in Streamlit
-            vessel_list_error = str(exc)
-
-    if vessel_options:
-        vessel_name = st.selectbox(
-            "Vessel",
-            options=vessel_options,
-            index=None,
-            placeholder="Search or select vessel",
-            help="Start typing to search. Full API data will load only after a vessel is selected and Refresh API data is pressed.",
-        )
-        vessel_name = vessel_name.strip() if vessel_name else ""
-    else:
+    api_col1, api_col2 = st.columns([2, 1])
+    with api_col1:
         vessel_name = st.text_input(
             "Vessel",
             placeholder="Type exact vessel name",
-            help="Fallback manual input appears only if the searchable API vessel list cannot be loaded.",
+            help="Required before API loading. This keeps the API call light.",
+        ).strip()
+    with api_col2:
+        vessel_field = st.text_input(
+            "API vessel field",
+            value="ShipName",
+            help="Change only if the API uses another vessel column name, e.g. VesselName.",
         ).strip()
 
-    if vessel_list_error:
-        with st.expander("Vessel list could not be loaded - details", expanded=False):
-            st.warning(vessel_list_error)
-            st.caption(
-                "You can still type the exact vessel name manually above and press Refresh API data. "
-                "The full API request will then check whether that vessel has reports in the latest 5 days."
-            )
-    elif not vessel_options:
-        st.info("No vessels found with reports during the latest 5 calendar days.")
-
-    if st.button("Refresh vessel list", use_container_width=True):
-        st.session_state["api_vessel_list_refresh_token"] += 1
-        st.rerun()
-
+    today_date = date.today()
     api_start_date = today_date - timedelta(days=4)
     api_end_date = today_date
     st.caption(f"API data window: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}, based on today.")
+
+    if "api_force_refresh_token" not in st.session_state:
+        st.session_state["api_force_refresh_token"] = 0
 
     if st.button("Refresh API data", type="primary", use_container_width=True):
         st.session_state.pop("api_uploaded_files", None)
@@ -402,9 +300,12 @@ else:
             st.stop()
 
         if not vessel_name:
-            st.warning("Please select or type a vessel before refreshing API data.")
+            st.warning("Please select/type a vessel before refreshing API data.")
             st.stop()
 
+        if not vessel_field:
+            st.warning("Please enter the API vessel field before refreshing API data.")
+            st.stop()
 
         st.session_state["api_force_refresh_token"] += 1
 
@@ -413,6 +314,7 @@ else:
                 api_df = fetch_api_noon_reports_last_5_days(
                     api_base_url,
                     vessel_name,
+                    vessel_field,
                     today_date,
                     st.session_state["api_force_refresh_token"],
                 )
