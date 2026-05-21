@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import requests
 import altair as alt
 import pandas as pd
 import streamlit as st
 
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "UPLOAD_ONLY_FLEET_FINAL_2026_05_21_NO_API"
+APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21"
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -143,15 +146,76 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Department auto-source helpers
+# -----------------------------------------------------------------------------
+
+class MemoryUploadedFile:
+    """Small uploaded-file-like wrapper so the existing validator can read auto-source bytes."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def make_sharepoint_download_url(url: str) -> str:
+    """Convert a SharePoint/OneDrive web-view URL into a best-effort download URL."""
+    parts = urlsplit(url.strip())
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("web", None)
+    query["download"] = "1"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_auto_source_file(source_url: str, refresh_token: int = 0) -> bytes:
+    """Download the department Excel source. refresh_token is used to force cache refresh."""
+    del refresh_token
+
+    if not source_url or not source_url.strip():
+        raise ValueError("AUTO_SOURCE_URL is missing from Streamlit secrets.")
+
+    download_url = make_sharepoint_download_url(source_url)
+    response = requests.get(
+        download_url,
+        timeout=90,
+        allow_redirects=True,
+        headers={
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    response.raise_for_status()
+
+    content = response.content
+    content_type = response.headers.get("Content-Type", "")
+
+    # xlsx/xlsm files are ZIP containers and normally start with PK.
+    # If SharePoint returns a login page/HTML, validation would fail later with a cryptic error.
+    if not content.startswith(b"PK"):
+        preview = content[:160].decode("utf-8", errors="ignore").replace("\n", " ").strip()
+        raise ValueError(
+            "The auto source did not return a downloadable Excel file. "
+            "It may require SharePoint login, or the link is not a direct/anonymous download link. "
+            f"Content-Type: {content_type}. Preview: {preview}"
+        )
+
+    return content
+
+
+# -----------------------------------------------------------------------------
 # Validation cache / dashboard rule-filter helpers
 # -----------------------------------------------------------------------------
 
 def build_source_signature(uploaded_files: list) -> tuple:
-    """Create a lightweight signature so filters do not trigger revalidation."""
+    """Create a robust signature so filters do not trigger revalidation, but source changes do."""
     signature = []
     for uploaded in uploaded_files:
         payload = uploaded.getvalue()
-        signature.append((uploaded.name, len(payload)))
+        payload_hash = hashlib.md5(payload).hexdigest()
+        signature.append((uploaded.name, len(payload), payload_hash))
     return tuple(signature)
 
 
@@ -313,18 +377,54 @@ with st.sidebar:
         config["distance_tolerance_pct"] = st.number_input("Distance tolerance %", value=float(DEFAULT_CONFIG["distance_tolerance_pct"]), step=0.01, format="%.2f")
 
 
-uploaded_files = st.file_uploader(
-    "Upload one or more Excel files",
-    type=["xlsx", "xlsm"],
-    accept_multiple_files=True,
-    help="Use a Power Query refreshed file. For fleet mode, upload one unified Excel for all vessels.",
+# -----------------------------------------------------------------------------
+# Data source
+# -----------------------------------------------------------------------------
+
+source_mode = st.radio(
+    "Data source",
+    ["Department auto source", "Manual upload"],
+    index=0,
+    horizontal=True,
 )
+
+uploaded_files = []
+
+if "auto_source_refresh_token" not in st.session_state:
+    st.session_state["auto_source_refresh_token"] = 0
+
+if source_mode == "Department auto source":
+    auto_source_url = st.secrets.get("AUTO_SOURCE_URL", "")
+    auto_source_file_name = st.secrets.get("AUTO_SOURCE_FILE_NAME", "All vessels.xlsx")
+
+    reload_col, _ = st.columns([1, 4])
+    if reload_col.button("Reload source file", use_container_width=True):
+        st.session_state["auto_source_refresh_token"] += 1
+
+    try:
+        auto_payload = fetch_auto_source_file(
+            auto_source_url,
+            st.session_state["auto_source_refresh_token"],
+        )
+        uploaded_files = [MemoryUploadedFile(auto_source_file_name, auto_payload)]
+    except Exception as exc:  # noqa: BLE001 - user-facing source error
+        st.error(f"Department auto source could not be loaded: {exc}")
+        st.info("Switch to Manual upload as backup, or update AUTO_SOURCE_URL in Streamlit Secrets.")
+        st.stop()
+
+else:
+    uploaded_files = st.file_uploader(
+        "Upload one or more Excel files",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="Use a Power Query refreshed file. For fleet mode, upload one unified Excel for all vessels.",
+    )
+
+    if not uploaded_files:
+        st.stop()
 
 with st.expander("Validation rules included", expanded=False):
     st.dataframe(pd.DataFrame(RULES), use_container_width=True, hide_index=True)
-
-if not uploaded_files:
-    st.stop()
 
 
 # -----------------------------------------------------------------------------
