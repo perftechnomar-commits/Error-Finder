@@ -20,9 +20,9 @@ st.caption("Upload ANTHEA-style noon report Excel files and run the adapted Erro
 
 API_VESSEL_FIELD = "ShipName"
 API_HEADERS = {"Accept": "application/json"}
-VESSEL_LIST_LOOKBACK_DAYS = 60  # lightweight dropdown lookup window; full report fetch remains latest 5 days
-VESSEL_LIST_MAX_PAGES = 5       # safety guard against heavy OData pagination
-REPORT_DATA_MAX_PAGES = 20         # one vessel / latest 5 days, but ReportData is long-format and may be paginated
+VESSEL_LIST_LOOKBACK_DAYS = 365  # dropdown lookup window; full report fetch remains latest 5 days
+VESSEL_LIST_MAX_PAGES = 50      # broader pagination so the dropdown is not limited to the first small API slice
+REPORT_DATA_MAX_PAGES = 20      # one vessel / latest 5 days, but ReportData is long-format and may be paginated
 
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
@@ -165,6 +165,13 @@ def get_odata_next_link(payload: dict | list) -> str | None:
     return None
 
 
+def normalize_next_link(next_url: str | None, current_url: str) -> str | None:
+    """Convert relative OData next links into absolute URLs."""
+    if not next_url:
+        return None
+    return requests.compat.urljoin(current_url, next_url)
+
+
 def get_marorka_auth() -> HTTPBasicAuth | HTTPDigestAuth:
     """Build the API authentication object from Streamlit secrets."""
     auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "digest")).lower().strip()
@@ -251,7 +258,7 @@ def fetch_api_vessel_options(
         rows = parse_odata_rows(payload)
         all_rows.extend(rows)
 
-        next_url = get_odata_next_link(payload)
+        next_url = normalize_next_link(get_odata_next_link(payload), response.url)
         if not next_url:
             break
 
@@ -314,7 +321,7 @@ def fetch_api_noon_reports_last_5_days(
         payload = read_odata_json(response, "Report data request")
         all_rows.extend(parse_odata_rows(payload))
 
-        next_url = get_odata_next_link(payload)
+        next_url = normalize_next_link(get_odata_next_link(payload), response.url)
         if not next_url:
             break
 
@@ -419,15 +426,22 @@ def transform_api_reportdata_like_power_query(raw_df: pd.DataFrame) -> pd.DataFr
         if "ReportType" in df.columns:
             df = df[~df["ReportType"].isin(["Intake Report", "Fuel Change Report"])].copy()
 
-        index_cols = [c for c in df.columns if c not in ["ValueDescription", "ReportedValue"]]
+        # Power Query pivots ValueDescription into columns on the already-loaded table.
+        # In pandas, pivot_table(dropna=False) across too many metadata columns can create
+        # a huge cartesian product and crash Streamlit. Use stable report-level keys instead.
+        preferred_index_cols = [
+            "ReportId", "ShipName", "ReportType", "StartDateTimeGMT",
+            "EndDateTimeGMT", "LapTime", "StateName",
+        ]
+        index_cols = [c for c in preferred_index_cols if c in df.columns]
+
+        if not index_cols:
+            index_cols = [c for c in df.columns if c not in ["ValueDescription", "ReportedValue"]]
+
         df = (
-            df.pivot_table(
-                index=index_cols,
-                columns="ValueDescription",
-                values="ReportedValue",
-                aggfunc="first",
-                dropna=False,
-            )
+            df.groupby(index_cols + ["ValueDescription"], dropna=False)["ReportedValue"]
+            .first()
+            .unstack("ValueDescription")
             .reset_index()
         )
         df.columns.name = None
@@ -859,6 +873,15 @@ else:
             help="Start typing to search. Full API data will load only after a vessel is selected and Refresh API data is pressed.",
         )
         vessel_name = vessel_name.strip() if vessel_name else ""
+
+        with st.expander("Vessel not in list? Type it manually", expanded=False):
+            manual_vessel_name = st.text_input(
+                "Manual vessel name",
+                placeholder="Type exact vessel name",
+                help="Use this only if the dropdown lookup does not include the vessel you need.",
+            ).strip()
+            if manual_vessel_name:
+                vessel_name = manual_vessel_name
     else:
         vessel_name = st.text_input(
             "Vessel",
@@ -885,7 +908,8 @@ else:
     st.caption(f"API data window: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}, based on today.")
 
     if st.button("Refresh API data", type="primary", use_container_width=True):
-        st.session_state.pop("api_uploaded_files", None)
+        st.session_state.pop("api_file_bytes", None)
+        st.session_state.pop("api_file_name", None)
         st.session_state.pop("api_loaded_vessel", None)
         st.session_state.pop("api_loaded_window", None)
 
@@ -927,12 +951,8 @@ else:
             st.dataframe(transformed_api_df.head(50), use_container_width=True, hide_index=True)
 
             api_excel = dataframe_to_excel_bytes(transformed_api_df)
-            api_file = ApiUploadedFile(
-                name=f"API_{vessel_name}_latest_5_days.xlsx",
-                data=api_excel.getvalue(),
-            )
-
-            st.session_state["api_uploaded_files"] = [api_file]
+            st.session_state["api_file_bytes"] = api_excel.getvalue()
+            st.session_state["api_file_name"] = f"API_{vessel_name}_latest_5_days.xlsx"
             st.session_state["api_loaded_vessel"] = vessel_name
             st.session_state["api_loaded_window"] = f"{api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}"
 
@@ -941,10 +961,14 @@ else:
             st.stop()
 
     if st.session_state.get("api_loaded_vessel") == vessel_name:
-        uploaded_files = st.session_state.get("api_uploaded_files", [])
+        api_file_bytes = st.session_state.get("api_file_bytes")
+        api_file_name = st.session_state.get("api_file_name")
         loaded_window = st.session_state.get("api_loaded_window")
-        if uploaded_files and loaded_window:
+        if api_file_bytes and api_file_name and loaded_window:
+            uploaded_files = [ApiUploadedFile(name=api_file_name, data=api_file_bytes)]
             st.caption(f"Loaded API data: {vessel_name} | {loaded_window}")
+        else:
+            uploaded_files = []
     else:
         uploaded_files = []
 
