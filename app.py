@@ -262,27 +262,14 @@ with st.sidebar:
 
     with st.expander("Validation rule scope", expanded=True):
         rule_options = get_rule_options()
-        preset = st.selectbox(
+        default_rules = [rule for rule in rule_options if "sludge" not in rule.lower()]
+
+        selected_rules = st.multiselect(
             "Rules to validate",
-            ["Full validation", "Operational essentials", "Performance only", "Consumption / ROB only", "Custom"],
-            index=0,
-            help="Changing this requires pressing Run validation again.",
+            options=rule_options,
+            default=default_rules,
+            help="All rules are selected by default except sludge-related rules. Changing this requires pressing Run validation again.",
         )
-
-        performance_rules = rules_by_keywords(rule_options, ["slip", "speed", "rpm", "load", "sfoc", "distance", "draft", "torque"])
-        consumption_rules = rules_by_keywords(rule_options, ["cons", "consumption", "rob", "fuel", "boiler", "dg", "mgo"])
-        operational_rules = sorted(set(performance_rules + consumption_rules)) or rule_options
-
-        if preset == "Full validation":
-            selected_rules = rule_options
-        elif preset == "Operational essentials":
-            selected_rules = operational_rules
-        elif preset == "Performance only":
-            selected_rules = performance_rules or rule_options
-        elif preset == "Consumption / ROB only":
-            selected_rules = consumption_rules or rule_options
-        else:
-            selected_rules = st.multiselect("Select rules", rule_options, default=rule_options)
 
 
     with st.expander("Sea passage / performance", expanded=True):
