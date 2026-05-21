@@ -1,21 +1,25 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
 from io import BytesIO
 
 import altair as alt
-import requests
-from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import pandas as pd
 import streamlit as st
 
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
+APP_BUILD = "UPLOAD_ONLY_FLEET_FINAL_2026_05_21_NO_API"
+
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
 st.title("Noon Report Checker")
-st.caption("Upload ANTHEA-style noon report Excel files and run the adapted Error Finder validation rules.")
+st.caption("Upload-only fleet validation dashboard. API source is intentionally disabled in this build.")
+st.caption(f"Build: {APP_BUILD}")
 
+
+# -----------------------------------------------------------------------------
+# General helpers
+# -----------------------------------------------------------------------------
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
     """Parse report datetimes robustly for filtering and KPI charts."""
@@ -37,7 +41,7 @@ def with_report_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_last_report_days(errors_df: pd.DataFrame, days: int = 2) -> tuple[pd.DataFrame, list]:
-    """Keep errors from the latest N report dates in the uploaded data, not from today's date."""
+    """Keep errors from the latest N report dates in the loaded data, not from today's date."""
     if errors_df.empty or "start_gmt" not in errors_df.columns:
         return errors_df.copy(), []
     dated = with_report_dates(errors_df)
@@ -52,8 +56,7 @@ def build_daily_kpis(checked_rows: pd.DataFrame, errors_df: pd.DataFrame) -> pd.
     if checked_rows.empty or "start_gmt" not in checked_rows.columns:
         return pd.DataFrame()
 
-    rows = with_report_dates(checked_rows)
-    rows = rows.dropna(subset=["report_date"]).copy()
+    rows = with_report_dates(checked_rows).dropna(subset=["report_date"]).copy()
     if rows.empty:
         return pd.DataFrame()
 
@@ -101,6 +104,7 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
     if df.empty:
         st.success("No validation errors found for this selection.")
         return
+
     preferred_cols = [
         "report_date",
         "file_name",
@@ -117,98 +121,139 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
         "columns",
     ]
     cols = [c for c in preferred_cols if c in df.columns]
-    st.dataframe(df[cols].sort_values(["report_date", "severity", "issue_type"], ascending=[False, True, True]), use_container_width=True, hide_index=True)
+    sort_cols = [c for c in ["report_date", "severity", "issue_type"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False, True, True][: len(sort_cols)])
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 
-def parse_odata_rows(payload: dict | list) -> list[dict]:
-    """Return rows from common OData response shapes."""
-    if isinstance(payload, list):
-        return payload
+# -----------------------------------------------------------------------------
+# Validation cache / rule scope helpers
+# -----------------------------------------------------------------------------
 
-    if not isinstance(payload, dict):
-        return []
-
-    if "value" in payload and isinstance(payload["value"], list):
-        return payload["value"]
-
-    nested = payload.get("d")
-    if isinstance(nested, dict) and isinstance(nested.get("results"), list):
-        return nested["results"]
-
-    return []
+def build_source_signature(uploaded_files: list) -> tuple:
+    """Create a lightweight signature so filters do not trigger revalidation."""
+    signature = []
+    for uploaded in uploaded_files:
+        payload = uploaded.getvalue()
+        signature.append((uploaded.name, len(payload)))
+    return tuple(signature)
 
 
-def get_marorka_auth() -> HTTPBasicAuth | HTTPDigestAuth:
-    """Build the API authentication object from Streamlit secrets."""
-    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "basic")).lower().strip()
-    username = st.secrets["MARORKA_USERNAME"]
-    password = st.secrets["MARORKA_PASSWORD"]
-
-    if auth_method == "digest":
-        return HTTPDigestAuth(username, password)
-
-    return HTTPBasicAuth(username, password)
+def build_config_signature(config: dict) -> tuple:
+    """Validation thresholds signature. Display filters are intentionally excluded."""
+    return tuple(sorted(config.items()))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_api_noon_reports_last_5_days(
-    base_url: str,
-    vessel_name: str,
-    vessel_field: str,
-    today_date: date,
-    force_refresh_token: int = 0,
-) -> pd.DataFrame:
-    """Fetch all API columns for one vessel, limited to the latest 5 calendar days."""
-    del force_refresh_token  # Used only to intentionally break cache when Refresh API data is pressed.
+def get_rule_name(rule: object) -> str:
+    """Extract a stable display name from RULES entries."""
+    if isinstance(rule, dict):
+        for key in ("issue_type", "rule", "name", "id", "Rule", "Rule Name"):
+            value = rule.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+    return str(rule)
 
-    start_date = today_date - timedelta(days=4)
-    end_date = today_date + timedelta(days=1)
-    escaped_vessel = vessel_name.replace("'", "''")
 
-    params = {
-        "$filter": (
-            f"StartDateTimeGMT ge DateTime'{start_date:%Y-%m-%d}' "
-            f"and StartDateTimeGMT lt DateTime'{end_date:%Y-%m-%d}' "
-            f"and {vessel_field} eq '{escaped_vessel}'"
-        ),
-        "$orderby": "StartDateTimeGMT desc",
-    }
+def get_rule_options() -> list[str]:
+    return sorted(set(get_rule_name(rule) for rule in RULES if str(get_rule_name(rule)).strip()))
 
-    response = requests.get(
-        base_url,
-        params=params,
-        auth=get_marorka_auth(),
-        timeout=60,
+
+def rules_by_keywords(rule_options: list[str], keywords: list[str]) -> list[str]:
+    out = []
+    for rule in rule_options:
+        text = rule.lower()
+        if any(keyword in text for keyword in keywords):
+            out.append(rule)
+    return out
+
+
+def rebuild_checked_rows_issue_counts(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
+    """Recalculate issue_count after validation rule scope is applied."""
+    out = checked_rows_df.copy()
+    if out.empty:
+        return out
+
+    keys = [c for c in ["file_name", "excel_row", "report_id", "ship_name"] if c in out.columns and c in errors_df.columns]
+    if "raw_issue_count" not in out.columns and "issue_count" in out.columns:
+        out["raw_issue_count"] = out["issue_count"]
+
+    if not keys or errors_df.empty:
+        out["issue_count"] = 0
+        return out
+
+    issue_counts = errors_df.groupby(keys, dropna=False).size().reset_index(name="display_issue_count")
+    out = out.merge(issue_counts, on=keys, how="left")
+    out["issue_count"] = out["display_issue_count"].fillna(0).astype(int)
+    return out.drop(columns=["display_issue_count"])
+
+
+def build_portfolio_summary(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
+    rows_total = len(checked_rows_df)
+    rows_with_errors = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) > 0).sum()) if rows_total else 0
+    rows_ok = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) == 0).sum()) if rows_total else 0
+    files_checked = checked_rows_df["file_name"].nunique() if "file_name" in checked_rows_df.columns else 0
+    return pd.DataFrame(
+        [
+            {"metric": "Files checked", "value": files_checked},
+            {"metric": "Report rows", "value": rows_total},
+            {"metric": "Rows with issues", "value": rows_with_errors},
+            {"metric": "Rows OK", "value": rows_ok},
+            {"metric": "Total issues", "value": len(errors_df)},
+        ]
     )
-    response.raise_for_status()
-
-    rows = parse_odata_rows(response.json())
-    return pd.DataFrame(rows)
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> BytesIO:
-    """Convert API dataframe into an Excel-like file for the existing validator."""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Table", index=False)
-    output.seek(0)
-    return output
+def apply_validation_rule_scope(combined_result: dict, selected_rules: list[str]) -> dict:
+    """Apply the selected validation rule scope to combined validation output."""
+    scoped = dict(combined_result)
+    errors_raw = combined_result["errors"].copy()
+    checked_rows_raw = combined_result["checked_rows"].copy()
+
+    if selected_rules and not errors_raw.empty and "issue_type" in errors_raw.columns:
+        errors = errors_raw[errors_raw["issue_type"].astype(str).isin(selected_rules)].copy()
+    elif selected_rules:
+        errors = errors_raw.copy()
+    else:
+        errors = errors_raw.iloc[0:0].copy()
+
+    checked_rows = rebuild_checked_rows_issue_counts(checked_rows_raw, errors)
+    by_rule = (
+        errors.groupby("issue_type", dropna=False).size().reset_index(name="count")
+        if not errors.empty and "issue_type" in errors.columns
+        else pd.DataFrame(columns=["issue_type", "count"])
+    )
+
+    scoped["errors"] = errors
+    scoped["checked_rows"] = checked_rows
+    scoped["by_rule"] = by_rule
+    scoped["portfolio_summary"] = build_portfolio_summary(checked_rows, errors)
+    return scoped
 
 
-class ApiUploadedFile:
-    """Small file-like wrapper so API data can reuse the existing validation pipeline."""
+def get_vessel_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
+    values = []
+    for df in (errors_df, rows_df):
+        if not df.empty and "ship_name" in df.columns:
+            values.extend(df["ship_name"].dropna().astype(str).unique().tolist())
+    return sorted(set(v for v in values if v.strip()))
 
-    def __init__(self, name: str, data: bytes) -> None:
-        self.name = name
-        self._data = data
 
-    def getvalue(self) -> bytes:
-        return self._data
+def apply_vessel_filter(df: pd.DataFrame, vessel_name: str) -> pd.DataFrame:
+    if df.empty or "ship_name" not in df.columns or vessel_name == "All vessels":
+        return df.copy()
+    return df[df["ship_name"].astype(str).eq(vessel_name)].copy()
 
+
+# -----------------------------------------------------------------------------
+# Sidebar controls
+# -----------------------------------------------------------------------------
 
 with st.sidebar:
+    st.caption(f"Build: {APP_BUILD}")
     st.header("Validation thresholds")
     st.write("Defaults match the ANTHEA Y checker adaptation.")
+
     config = DEFAULT_CONFIG.copy()
     recent_days = st.number_input(
         "Recent problem table: last N report days",
@@ -216,14 +261,42 @@ with st.sidebar:
         max_value=14,
         value=2,
         step=1,
-        help="Uses the latest report dates found inside the uploaded Excel, not today's calendar date.",
+        help="Display filter only. It does not rerun validation.",
     )
+
+    with st.expander("Validation rule scope", expanded=True):
+        rule_options = get_rule_options()
+        preset = st.selectbox(
+            "Rules to validate",
+            ["Full validation", "Operational essentials", "Performance only", "Consumption / ROB only", "Custom"],
+            index=0,
+            help="Changing this requires pressing Run validation again.",
+        )
+
+        performance_rules = rules_by_keywords(rule_options, ["slip", "speed", "rpm", "load", "sfoc", "distance", "draft", "torque"])
+        consumption_rules = rules_by_keywords(rule_options, ["cons", "consumption", "rob", "fuel", "boiler", "dg", "mgo"])
+        operational_rules = sorted(set(performance_rules + consumption_rules)) or rule_options
+
+        if preset == "Full validation":
+            selected_rules = rule_options
+        elif preset == "Operational essentials":
+            selected_rules = operational_rules
+        elif preset == "Performance only":
+            selected_rules = performance_rules or rule_options
+        elif preset == "Consumption / ROB only":
+            selected_rules = consumption_rules or rule_options
+        else:
+            selected_rules = st.multiselect("Select rules", rule_options, default=rule_options)
+
+        st.caption(f"Selected {len(selected_rules)} of {len(rule_options)} rules.")
+
     with st.expander("Sea passage / performance", expanded=True):
         config["low_steaming_hours"] = st.number_input("Low steaming below hours", value=float(DEFAULT_CONFIG["low_steaming_hours"]), step=0.5)
         config["slip_min"] = st.number_input("Slip min", value=float(DEFAULT_CONFIG["slip_min"]), step=0.01, format="%.2f")
         config["slip_max"] = st.number_input("Slip max", value=float(DEFAULT_CONFIG["slip_max"]), step=0.01, format="%.2f")
         config["me_load_min"] = st.number_input("ME Load min", value=float(DEFAULT_CONFIG["me_load_min"]), step=0.01, format="%.2f")
         config["me_load_max"] = st.number_input("ME Load max", value=float(DEFAULT_CONFIG["me_load_max"]), step=0.01, format="%.2f")
+
     with st.expander("Consumption / ROB", expanded=False):
         config["electric_load_min_kw"] = st.number_input("Electric load min kW", value=float(DEFAULT_CONFIG["electric_load_min_kw"]), step=50.0)
         config["electric_load_max_kw"] = st.number_input("Electric load max kW", value=float(DEFAULT_CONFIG["electric_load_max_kw"]), step=100.0)
@@ -231,6 +304,7 @@ with st.sidebar:
         config["boiler_cons_max_mt"] = st.number_input("Boiler cons max MT", value=float(DEFAULT_CONFIG["boiler_cons_max_mt"]), step=0.5)
         config["dg_cons_high_mt"] = st.number_input("DG cons high MT", value=float(DEFAULT_CONFIG["dg_cons_high_mt"]), step=0.5)
         config["dg_cons_low_mt"] = st.number_input("DG cons low MT", value=float(DEFAULT_CONFIG["dg_cons_low_mt"]), step=0.1)
+
     with st.expander("Advanced", expanded=False):
         config["sfoc_min"] = st.number_input("SFOC min", value=float(DEFAULT_CONFIG["sfoc_min"]), step=5.0)
         config["sfoc_max"] = st.number_input("SFOC max", value=float(DEFAULT_CONFIG["sfoc_max"]), step=5.0)
@@ -239,150 +313,89 @@ with st.sidebar:
         config["difference_pct_avg_band"] = st.number_input("Consumption % average band", value=float(DEFAULT_CONFIG["difference_pct_avg_band"]), step=0.01, format="%.2f")
         config["distance_tolerance_pct"] = st.number_input("Distance tolerance %", value=float(DEFAULT_CONFIG["distance_tolerance_pct"]), step=0.01, format="%.2f")
 
-st.subheader("Data source")
 
-source_option = st.radio(
-    "Choose data source",
-    ["File upload", "API"],
-    horizontal=True,
-    help="Use API for a light latest-5-days check on one vessel. Use upload for multiple vessels or older periods.",
+uploaded_files = st.file_uploader(
+    "Upload one or more Excel files",
+    type=["xlsx", "xlsm"],
+    accept_multiple_files=True,
+    help="Use a Power Query refreshed file. For fleet mode, upload one unified Excel for all vessels.",
 )
-
-uploaded_files = []
-
-if source_option == "File upload":
-    uploaded_files = st.file_uploader(
-        "Upload one or more Excel files",
-        type=["xlsx", "xlsm"],
-        accept_multiple_files=True,
-        help="Use this option for multiple vessels, older periods, or manually exported files.",
-    )
-
-else:
-    st.info(
-        "API mode fetches all API columns, but only for one selected vessel and only for the latest 5 calendar days."
-    )
-
-    api_base_url = st.text_input(
-        "API endpoint",
-        value="https://online.marorka.com/Odata/v1/ODataService.svc/ReportData",
-    ).strip()
-
-    api_col1, api_col2 = st.columns([2, 1])
-    with api_col1:
-        vessel_name = st.text_input(
-            "Vessel",
-            placeholder="Type exact vessel name",
-            help="Required before API loading. This keeps the API call light.",
-        ).strip()
-    with api_col2:
-        vessel_field = st.text_input(
-            "API vessel field",
-            value="ShipName",
-            help="Change only if the API uses another vessel column name, e.g. VesselName.",
-        ).strip()
-
-    today_date = date.today()
-    api_start_date = today_date - timedelta(days=4)
-    api_end_date = today_date
-    st.caption(f"API data window: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}, based on today.")
-
-    if "api_force_refresh_token" not in st.session_state:
-        st.session_state["api_force_refresh_token"] = 0
-
-    if st.button("Refresh API data", type="primary", use_container_width=True):
-        st.session_state.pop("api_uploaded_files", None)
-        st.session_state.pop("api_loaded_vessel", None)
-        st.session_state.pop("api_loaded_window", None)
-
-        if not api_base_url:
-            st.warning("Please enter the API endpoint before refreshing API data.")
-            st.stop()
-
-        if not vessel_name:
-            st.warning("Please select/type a vessel before refreshing API data.")
-            st.stop()
-
-        if not vessel_field:
-            st.warning("Please enter the API vessel field before refreshing API data.")
-            st.stop()
-
-        st.session_state["api_force_refresh_token"] += 1
-
-        try:
-            with st.spinner("Fetching latest 5 days from API..."):
-                api_df = fetch_api_noon_reports_last_5_days(
-                    api_base_url,
-                    vessel_name,
-                    vessel_field,
-                    today_date,
-                    st.session_state["api_force_refresh_token"],
-                )
-
-            if api_df.empty:
-                st.warning(f"No report found for {vessel_name} during the latest 5 calendar days.")
-                st.stop()
-
-            st.success(f"Fetched {len(api_df):,} API rows for {vessel_name} from the latest 5 calendar days.")
-            st.dataframe(api_df.head(50), use_container_width=True, hide_index=True)
-
-            api_excel = dataframe_to_excel_bytes(api_df)
-            api_file = ApiUploadedFile(
-                name=f"API_{vessel_name}_latest_5_days.xlsx",
-                data=api_excel.getvalue(),
-            )
-
-            st.session_state["api_uploaded_files"] = [api_file]
-            st.session_state["api_loaded_vessel"] = vessel_name
-            st.session_state["api_loaded_window"] = f"{api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}"
-
-        except Exception as exc:  # noqa: BLE001 - show user-facing API errors in Streamlit
-            st.error(f"API fetch failed: {exc}")
-            st.stop()
-
-    if st.session_state.get("api_loaded_vessel") == vessel_name:
-        uploaded_files = st.session_state.get("api_uploaded_files", [])
-        loaded_window = st.session_state.get("api_loaded_window")
-        if uploaded_files and loaded_window:
-            st.caption(f"Loaded API data: {vessel_name} | {loaded_window}")
-    else:
-        uploaded_files = []
 
 with st.expander("Validation rules included", expanded=False):
     st.dataframe(pd.DataFrame(RULES), use_container_width=True, hide_index=True)
 
 if not uploaded_files:
-    if source_option == "File upload":
-        st.info("Upload an ANTHEA-style noon report Excel file to start.")
-    else:
-        st.info("Select a vessel and refresh API data to start.")
+    st.info("Upload an ANTHEA-style noon report Excel file to start.")
     st.stop()
+
+
+# -----------------------------------------------------------------------------
+# Validation execution: run once, then dashboard filters are smooth
+# -----------------------------------------------------------------------------
+
+current_source_signature = build_source_signature(uploaded_files)
+current_config_signature = build_config_signature(config)
+current_rule_signature = tuple(selected_rules)
+
+for key, default in {
+    "validation_combined": None,
+    "validation_failed": [],
+    "validation_source_signature": None,
+    "validation_config_signature": None,
+    "validation_rule_signature": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 run = st.button("Run validation", type="primary", use_container_width=True)
-if not run:
+
+if run:
+    all_results = []
+    failed = []
+    progress = st.progress(0, text="Starting validation...")
+
+    for pos, uploaded in enumerate(uploaded_files, start=1):
+        try:
+            payload = uploaded.getvalue()
+            result = validate_excel_file(BytesIO(payload), file_name=uploaded.name, config=config)
+            all_results.append(result)
+        except Exception as exc:  # noqa: BLE001 - show user-facing file errors in Streamlit
+            failed.append({"file_name": uploaded.name, "error": str(exc)})
+        progress.progress(pos / len(uploaded_files), text=f"Validated {pos}/{len(uploaded_files)} files")
+
+    progress.empty()
+
+    if all_results:
+        raw_combined = combine_results(all_results)
+        st.session_state["validation_combined"] = apply_validation_rule_scope(raw_combined, selected_rules)
+        st.session_state["validation_source_signature"] = current_source_signature
+        st.session_state["validation_config_signature"] = current_config_signature
+        st.session_state["validation_rule_signature"] = current_rule_signature
+    else:
+        st.session_state["validation_combined"] = None
+
+    st.session_state["validation_failed"] = failed
+
+if st.session_state["validation_combined"] is None:
+    st.info("Run validation once. After that, vessel/report/rule display filters work without rerunning validation.")
     st.stop()
 
-all_results = []
-failed = []
-progress = st.progress(0, text="Starting validation...")
-for pos, uploaded in enumerate(uploaded_files, start=1):
-    try:
-        payload = uploaded.getvalue()
-        result = validate_excel_file(BytesIO(payload), file_name=uploaded.name, config=config)
-        all_results.append(result)
-    except Exception as exc:  # noqa: BLE001 - show user-facing file errors in Streamlit
-        failed.append({"file_name": uploaded.name, "error": str(exc)})
-    progress.progress(pos / len(uploaded_files), text=f"Validated {pos}/{len(uploaded_files)} files")
-progress.empty()
+if st.session_state["validation_source_signature"] != current_source_signature:
+    st.warning("The uploaded source file changed. Click Run validation to apply the new file.")
+    st.stop()
 
+if st.session_state["validation_config_signature"] != current_config_signature:
+    st.info("Validation thresholds changed. Current results still use the previous thresholds. Click Run validation to apply them.")
+
+if st.session_state["validation_rule_signature"] != current_rule_signature:
+    st.info("Validation rule scope changed. Current results still use the previous rule scope. Click Run validation to apply it.")
+
+failed = st.session_state["validation_failed"]
 if failed:
     st.error("Some files could not be validated.")
     st.dataframe(pd.DataFrame(failed), use_container_width=True, hide_index=True)
 
-if not all_results:
-    st.stop()
-
-combined = combine_results(all_results)
+combined = st.session_state["validation_combined"]
 summary = combined["portfolio_summary"]
 errors = combined["errors"]
 checked_rows = combined["checked_rows"]
@@ -390,119 +403,192 @@ by_rule = combined["by_rule"]
 skipped_rules = combined["skipped_rules"]
 
 recent_errors, recent_dates = filter_last_report_days(errors, int(recent_days))
-daily_kpis = build_daily_kpis(checked_rows, errors)
 errors_dated = with_report_dates(errors) if not errors.empty else errors.copy()
 checked_rows_dated = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
 
-metric_map = dict(zip(summary["metric"], summary["value"]))
-rows_total = int(metric_map.get("Report rows", 0))
-rows_with_errors = int(metric_map.get("Rows with issues", 0))
-total_errors = int(metric_map.get("Total issues", 0))
+
+# -----------------------------------------------------------------------------
+# Vessel selection / fleet drill-down
+# -----------------------------------------------------------------------------
+
+vessel_options = get_vessel_options(errors_dated, checked_rows_dated)
+valid_vessels = ["All vessels"] + vessel_options
+if "selected_vessel_filter" not in st.session_state or st.session_state["selected_vessel_filter"] not in valid_vessels:
+    st.session_state["selected_vessel_filter"] = "All vessels"
+
+if vessel_options:
+    vessel_rows_summary = (
+        checked_rows_dated.groupby("ship_name", dropna=False)
+        .agg(
+            report_rows=("excel_row", "count"),
+            rows_with_errors=("issue_count", lambda s: int((s > 0).sum())),
+            rows_ok=("issue_count", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+        .rename(columns={"ship_name": "Vessel"})
+    )
+    vessel_errors_summary = (
+        errors_dated.groupby("ship_name", dropna=False)
+        .agg(
+            total_errors=("issue_type", "count"),
+            high_severity_errors=("severity", lambda s: int((s == "High").sum())),
+        )
+        .reset_index()
+        .rename(columns={"ship_name": "Vessel"})
+        if not errors_dated.empty and "ship_name" in errors_dated.columns
+        else pd.DataFrame(columns=["Vessel", "total_errors", "high_severity_errors"])
+    )
+    vessel_summary = vessel_rows_summary.merge(vessel_errors_summary, on="Vessel", how="left")
+    vessel_summary[["total_errors", "high_severity_errors"]] = vessel_summary[["total_errors", "high_severity_errors"]].fillna(0).astype(int)
+    vessel_summary["error_row_rate"] = vessel_summary["rows_with_errors"] / vessel_summary["report_rows"].replace(0, pd.NA)
+    vessel_summary = vessel_summary.sort_values(["high_severity_errors", "total_errors", "error_row_rate"], ascending=[False, False, False])
+else:
+    vessel_summary = pd.DataFrame()
+
+if vessel_options:
+    st.divider()
+    st.subheader("Vessel selection")
+    button_cols = st.columns(6)
+    if button_cols[0].button("All vessels", use_container_width=True):
+        st.session_state["selected_vessel_filter"] = "All vessels"
+    for idx, row in enumerate(vessel_summary.head(5).itertuples(index=False), start=1):
+        label = f"{str(row.Vessel)[:18]} ({int(row.total_errors)})"
+        if button_cols[idx].button(label, use_container_width=True):
+            st.session_state["selected_vessel_filter"] = str(row.Vessel)
+
+    selected_vessel = st.selectbox(
+        "Search or select vessel",
+        options=valid_vessels,
+        index=valid_vessels.index(st.session_state["selected_vessel_filter"]),
+        help="Use All vessels for fleet view, or select one vessel to drill down.",
+    )
+    st.session_state["selected_vessel_filter"] = selected_vessel
+else:
+    selected_vessel = "All vessels"
+
+errors_scope = apply_vessel_filter(errors_dated, selected_vessel)
+recent_errors_scope = apply_vessel_filter(recent_errors, selected_vessel)
+checked_rows_scope = apply_vessel_filter(checked_rows_dated, selected_vessel)
+daily_kpis_scope = build_daily_kpis(checked_rows_scope, errors_scope)
+by_rule_scope = (
+    errors_scope.groupby("issue_type", dropna=False).size().reset_index(name="count")
+    if not errors_scope.empty and "issue_type" in errors_scope.columns
+    else pd.DataFrame(columns=["issue_type", "count"])
+)
+by_severity_scope = (
+    errors_scope.groupby("severity", dropna=False).size().reset_index(name="count")
+    if not errors_scope.empty and "severity" in errors_scope.columns
+    else pd.DataFrame(columns=["severity", "count"])
+)
+
+rows_total = len(checked_rows_scope)
+rows_with_errors = int((checked_rows_scope["issue_count"] > 0).sum()) if "issue_count" in checked_rows_scope.columns else 0
+rows_ok = int((checked_rows_scope["issue_count"] == 0).sum()) if "issue_count" in checked_rows_scope.columns else 0
+total_errors = len(errors_scope)
 error_rate = rows_with_errors / rows_total if rows_total else 0
 avg_errors_per_problem_row = total_errors / rows_with_errors if rows_with_errors else 0
+status_summary_scope = pd.DataFrame([{"status": "Rows with errors", "count": rows_with_errors}, {"status": "Rows OK", "count": rows_ok}])
 
 cols = st.columns(6)
-cols[0].metric("Files", int(metric_map.get("Files checked", 0)))
+cols[0].metric("View", selected_vessel)
 cols[1].metric("Rows", rows_total)
 cols[2].metric("Rows with errors", rows_with_errors)
-cols[3].metric("Rows OK", int(metric_map.get("Rows OK", 0)))
+cols[3].metric("Rows OK", rows_ok)
 cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
 recent_label = ", ".join(str(d) for d in recent_dates) if recent_dates else "no report dates found"
 st.info(f"Recent problem table is based on the latest {int(recent_days)} report day(s): {recent_label}.")
 
-# Extra KPI summary frames for charts/export.
-by_severity = errors.groupby("severity", dropna=False).size().reset_index(name="count") if not errors.empty else pd.DataFrame(columns=["severity", "count"])
-status_summary = pd.DataFrame(
-    [
-        {"status": "Rows with errors", "count": rows_with_errors},
-        {"status": "Rows OK", "count": int(metric_map.get("Rows OK", 0))},
-    ]
+
+# -----------------------------------------------------------------------------
+# Tabs
+# -----------------------------------------------------------------------------
+
+fleet_tab, main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs(
+    ["Fleet overview", "All errors", f"Last {int(recent_days)} days", "KPI dashboard", "Checked rows", "Export / setup"]
 )
 
-main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs([
-    "All errors",
-    f"Last {int(recent_days)} days",
-    "KPI dashboard",
-    "Checked rows",
-    "Export / setup",
-])
+with fleet_tab:
+    st.subheader("Fleet overview")
+    if vessel_summary.empty:
+        st.info("No vessel information found in the validation results.")
+    else:
+        overview_cols = st.columns(4)
+        overview_cols[0].metric("Vessels", vessel_summary["Vessel"].nunique())
+        overview_cols[1].metric("Fleet rows", int(vessel_summary["report_rows"].sum()))
+        overview_cols[2].metric("Fleet total errors", int(vessel_summary["total_errors"].sum()))
+        overview_cols[3].metric("Vessels with High errors", int((vessel_summary["high_severity_errors"] > 0).sum()))
+
+        display_summary = vessel_summary.copy()
+        display_summary["error_row_rate"] = display_summary["error_row_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+        st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+        st.subheader("Top vessels by total errors")
+        st.bar_chart(vessel_summary.sort_values("total_errors", ascending=False).head(10).set_index("Vessel")["total_errors"])
 
 with main_tab:
     st.subheader("Errors")
-    if errors.empty:
-        st.success("No validation errors found.")
+    if errors_scope.empty:
+        st.success("No validation errors found for this vessel selection.")
     else:
         left, mid, right = st.columns(3)
-        file_filter = left.multiselect("File", sorted(errors["file_name"].dropna().unique().tolist()), default=sorted(errors["file_name"].dropna().unique().tolist()))
-        rule_filter = mid.multiselect("Rule", sorted(errors["issue_type"].dropna().unique().tolist()), default=sorted(errors["issue_type"].dropna().unique().tolist()))
-        severity_filter = right.multiselect("Severity", sorted(errors["severity"].dropna().unique().tolist()), default=sorted(errors["severity"].dropna().unique().tolist()))
-        view = errors_dated[
-            errors_dated["file_name"].isin(file_filter)
-            & errors_dated["issue_type"].isin(rule_filter)
-            & errors_dated["severity"].isin(severity_filter)
+        rule_filter = left.multiselect("Rule", sorted(errors_scope["issue_type"].dropna().unique().tolist()), default=sorted(errors_scope["issue_type"].dropna().unique().tolist()))
+        severity_filter = mid.multiselect("Severity", sorted(errors_scope["severity"].dropna().unique().tolist()), default=sorted(errors_scope["severity"].dropna().unique().tolist()))
+        report_type_options = sorted(errors_scope["report_type"].dropna().unique().tolist()) if "report_type" in errors_scope.columns else []
+        report_type_filter = right.multiselect("Report type", report_type_options, default=report_type_options)
+
+        view = errors_scope[
+            errors_scope["issue_type"].isin(rule_filter)
+            & errors_scope["severity"].isin(severity_filter)
         ].copy()
+        if "report_type" in view.columns and report_type_filter:
+            view = view[view["report_type"].isin(report_type_filter)].copy()
         display_error_table("Filtered errors", view)
 
-    if not by_rule.empty:
+    if not by_rule_scope.empty:
         st.subheader("Errors by rule")
-        st.dataframe(by_rule.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(by_rule_scope.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
 with recent_tab:
-    display_error_table(f"Problems in the latest {int(recent_days)} report day(s)", recent_errors)
+    display_error_table(f"Problems in the latest {int(recent_days)} report day(s)", recent_errors_scope)
 
-    available_dates = sorted([d for d in errors_dated.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_dated.empty else []
+    available_dates = sorted([d for d in errors_scope.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_scope.empty else []
     if available_dates:
         st.divider()
         selected_date = st.selectbox("Show problems for one specific report day", options=available_dates, index=len(available_dates) - 1)
-        day_errors = errors_dated[errors_dated["report_date"].eq(selected_date)].copy()
+        day_errors = errors_scope[errors_scope["report_date"].eq(selected_date)].copy()
         display_error_table(f"Problems for {selected_date}", day_errors)
 
 with kpi_tab:
     st.subheader("KPI dashboard")
     kpi_cols = st.columns(4)
-    kpi_cols[0].metric("Recent errors", len(recent_errors))
+    kpi_cols[0].metric("Recent errors", len(recent_errors_scope))
     kpi_cols[1].metric("Avg errors / problem row", f"{avg_errors_per_problem_row:.2f}")
-    kpi_cols[2].metric("Unique error types", errors["issue_type"].nunique() if not errors.empty else 0)
-    kpi_cols[3].metric("High severity errors", int((errors["severity"].eq("High")).sum()) if not errors.empty else 0)
+    kpi_cols[2].metric("Unique error types", errors_scope["issue_type"].nunique() if not errors_scope.empty else 0)
+    kpi_cols[3].metric("High severity errors", int((errors_scope["severity"].eq("High")).sum()) if not errors_scope.empty and "severity" in errors_scope.columns else 0)
 
     chart_left, chart_right = st.columns(2)
     with chart_left:
-        if not status_summary.empty and status_summary["count"].sum() > 0:
-            st.altair_chart(pie_chart(status_summary, "status", "count", "Rows OK vs rows with errors"), use_container_width=True)
+        if not status_summary_scope.empty and status_summary_scope["count"].sum() > 0:
+            st.altair_chart(pie_chart(status_summary_scope, "status", "count", "Rows OK vs rows with errors"), use_container_width=True)
     with chart_right:
-        if not by_severity.empty and by_severity["count"].sum() > 0:
-            st.altair_chart(pie_chart(by_severity, "severity", "count", "Errors by severity"), use_container_width=True)
+        if not by_severity_scope.empty and by_severity_scope["count"].sum() > 0:
+            st.altair_chart(pie_chart(by_severity_scope, "severity", "count", "Errors by severity"), use_container_width=True)
 
-    if not by_rule.empty:
-        top_rules = by_rule.sort_values("count", ascending=False).head(10)
+    if not by_rule_scope.empty:
         st.subheader("Top error categories")
-        st.bar_chart(top_rules.set_index("issue_type")["count"])
+        st.bar_chart(by_rule_scope.sort_values("count", ascending=False).head(10).set_index("issue_type")["count"])
 
-    if not daily_kpis.empty:
+    if not daily_kpis_scope.empty:
         st.subheader("Daily validation trend")
-        daily_for_chart = daily_kpis.sort_values("report_date")
+        daily_for_chart = daily_kpis_scope.sort_values("report_date")
         st.line_chart(daily_for_chart.set_index("report_date")[["total_errors", "rows_with_errors"]])
-        st.dataframe(daily_kpis, use_container_width=True, hide_index=True)
-
-    st.subheader("Extra KPI ideas to add next")
-    st.markdown(
-        """
-- **Error rate by vessel / file**: ποσοστό προβληματικών rows ανά πλοίο ή αρχείο.
-- **Top 5 recurring rules**: ποιοι κανόνες εμφανίζονται πιο συχνά, για να ξέρεις πού χρειάζεται training ή correction.
-- **Severity mix pie**: High / Medium / Low errors σε πίτα.
-- **Rows OK vs problematic pie**: γρήγορη εικόνα ποιότητας report.
-- **Daily trend**: errors ανά report date, ώστε να βλέπεις αν βελτιώνεται ή χειροτερεύει η ποιότητα.
-- **Consumption / performance KPIs**: SFOC outliers, Slip outliers, DG consumption vs load, boiler consumption exceedances.
-- **Data completeness KPI**: πόσα required columns λείπουν ή πόσα blank critical fields υπάρχουν.
-- **Critical open issues table**: μόνο High severity ή rules που επηρεάζουν consumption/performance.
-        """
-    )
+        st.dataframe(daily_kpis_scope, use_container_width=True, hide_index=True)
 
 with rows_tab:
     st.subheader("Checked rows")
-    st.dataframe(checked_rows_dated, use_container_width=True, hide_index=True)
+    st.dataframe(checked_rows_scope, use_container_width=True, hide_index=True)
 
     if not skipped_rules.empty:
         st.warning("Some rules were skipped because required columns were not found in at least one file.")
@@ -511,33 +597,35 @@ with rows_tab:
 with export_tab:
     st.subheader("Export results")
     combined_for_export = dict(combined)
-    combined_for_export["recent_errors"] = recent_errors
-    combined_for_export["daily_kpis"] = daily_kpis
-    combined_for_export["by_severity"] = by_severity
-    combined_for_export["status_summary"] = status_summary
+    combined_for_export["errors"] = errors_scope
+    combined_for_export["checked_rows"] = checked_rows_scope
+    combined_for_export["by_rule"] = by_rule_scope
+    combined_for_export["portfolio_summary"] = build_portfolio_summary(checked_rows_scope, errors_scope)
+    combined_for_export["recent_errors"] = recent_errors_scope
+    combined_for_export["daily_kpis"] = daily_kpis_scope
+    combined_for_export["by_severity"] = by_severity_scope
+    combined_for_export["status_summary"] = status_summary_scope
 
     excel_bytes = results_to_excel_bytes(combined_for_export)
     st.download_button(
-        "Download Excel validation report",
+        "Download Excel validation report for current selection",
         data=excel_bytes,
         file_name="noon_report_validation_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    csv_bytes = errors.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "Download all errors as CSV",
-        data=csv_bytes,
-        file_name="noon_report_errors.csv",
+        "Download current selection errors as CSV",
+        data=errors_scope.to_csv(index=False).encode("utf-8-sig"),
+        file_name="noon_report_errors_current_selection.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    recent_csv_bytes = recent_errors.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"Download last {int(recent_days)} days errors as CSV",
-        data=recent_csv_bytes,
+        data=recent_errors_scope.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"noon_report_errors_last_{int(recent_days)}_days.csv",
         mime="text/csv",
         use_container_width=True,
