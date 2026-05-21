@@ -13,8 +13,6 @@ APP_BUILD = "UPLOAD_ONLY_FLEET_FINAL_2026_05_21_NO_API"
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
 st.title("Noon Report Checker")
-st.caption("Upload-only fleet validation dashboard. API source is intentionally disabled in this build.")
-st.caption(f"Build: {APP_BUILD}")
 
 
 # -----------------------------------------------------------------------------
@@ -250,9 +248,7 @@ def apply_vessel_filter(df: pd.DataFrame, vessel_name: str) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 with st.sidebar:
-    st.caption(f"Build: {APP_BUILD}")
     st.header("Validation thresholds")
-    st.write("Defaults match the ANTHEA Y checker adaptation.")
 
     config = DEFAULT_CONFIG.copy()
     recent_days = st.number_input(
@@ -288,7 +284,6 @@ with st.sidebar:
         else:
             selected_rules = st.multiselect("Select rules", rule_options, default=rule_options)
 
-        st.caption(f"Selected {len(selected_rules)} of {len(rule_options)} rules.")
 
     with st.expander("Sea passage / performance", expanded=True):
         config["low_steaming_hours"] = st.number_input("Low steaming below hours", value=float(DEFAULT_CONFIG["low_steaming_hours"]), step=0.5)
@@ -325,7 +320,6 @@ with st.expander("Validation rules included", expanded=False):
     st.dataframe(pd.DataFrame(RULES), use_container_width=True, hide_index=True)
 
 if not uploaded_files:
-    st.info("Upload an ANTHEA-style noon report Excel file to start.")
     st.stop()
 
 
