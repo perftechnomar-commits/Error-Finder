@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from io import BytesIO
 
 import altair as alt
+import requests
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import pandas as pd
 import streamlit as st
 
@@ -117,6 +120,92 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
     st.dataframe(df[cols].sort_values(["report_date", "severity", "issue_type"], ascending=[False, True, True]), use_container_width=True, hide_index=True)
 
 
+def parse_odata_rows(payload: dict | list) -> list[dict]:
+    """Return rows from common OData response shapes."""
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return []
+
+    if "value" in payload and isinstance(payload["value"], list):
+        return payload["value"]
+
+    nested = payload.get("d")
+    if isinstance(nested, dict) and isinstance(nested.get("results"), list):
+        return nested["results"]
+
+    return []
+
+
+def get_marorka_auth() -> HTTPBasicAuth | HTTPDigestAuth:
+    """Build the API authentication object from Streamlit secrets."""
+    auth_method = str(st.secrets.get("MARORKA_AUTH_METHOD", "basic")).lower().strip()
+    username = st.secrets["MARORKA_USERNAME"]
+    password = st.secrets["MARORKA_PASSWORD"]
+
+    if auth_method == "digest":
+        return HTTPDigestAuth(username, password)
+
+    return HTTPBasicAuth(username, password)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_api_noon_reports_last_5_days(
+    base_url: str,
+    vessel_name: str,
+    vessel_field: str,
+    today_date: date,
+    force_refresh_token: int = 0,
+) -> pd.DataFrame:
+    """Fetch all API columns for one vessel, limited to the latest 5 calendar days."""
+    del force_refresh_token  # Used only to intentionally break cache when Refresh API data is pressed.
+
+    start_date = today_date - timedelta(days=4)
+    end_date = today_date + timedelta(days=1)
+    escaped_vessel = vessel_name.replace("'", "''")
+
+    params = {
+        "$filter": (
+            f"StartDateTimeGMT ge DateTime'{start_date:%Y-%m-%d}' "
+            f"and StartDateTimeGMT lt DateTime'{end_date:%Y-%m-%d}' "
+            f"and {vessel_field} eq '{escaped_vessel}'"
+        ),
+        "$orderby": "StartDateTimeGMT desc",
+    }
+
+    response = requests.get(
+        base_url,
+        params=params,
+        auth=get_marorka_auth(),
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    rows = parse_odata_rows(response.json())
+    return pd.DataFrame(rows)
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> BytesIO:
+    """Convert API dataframe into an Excel-like file for the existing validator."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Table", index=False)
+    output.seek(0)
+    return output
+
+
+class ApiUploadedFile:
+    """Small file-like wrapper so API data can reuse the existing validation pipeline."""
+
+    def __init__(self, name: str, data: bytes) -> None:
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
 with st.sidebar:
     st.header("Validation thresholds")
     st.write("Defaults match the ANTHEA Y checker adaptation.")
@@ -150,18 +239,123 @@ with st.sidebar:
         config["difference_pct_avg_band"] = st.number_input("Consumption % average band", value=float(DEFAULT_CONFIG["difference_pct_avg_band"]), step=0.01, format="%.2f")
         config["distance_tolerance_pct"] = st.number_input("Distance tolerance %", value=float(DEFAULT_CONFIG["distance_tolerance_pct"]), step=0.01, format="%.2f")
 
-uploaded_files = st.file_uploader(
-    "Upload one or more Excel files",
-    type=["xlsx", "xlsm"],
-    accept_multiple_files=True,
-    help="The app expects an ANTHEA-style workbook with a 'Table' sheet. If missing, it uses 'Query1' or the first sheet.",
+st.subheader("Data source")
+
+source_option = st.radio(
+    "Choose data source",
+    ["File upload", "API"],
+    horizontal=True,
+    help="Use API for a light latest-5-days check on one vessel. Use upload for multiple vessels or older periods.",
 )
+
+uploaded_files = []
+
+if source_option == "File upload":
+    uploaded_files = st.file_uploader(
+        "Upload one or more Excel files",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="Use this option for multiple vessels, older periods, or manually exported files.",
+    )
+
+else:
+    st.info(
+        "API mode fetches all API columns, but only for one selected vessel and only for the latest 5 calendar days."
+    )
+
+    api_base_url = st.text_input(
+        "API endpoint",
+        value="https://online.marorka.com/Odata/v1/ODataService.svc/ReportData",
+    ).strip()
+
+    api_col1, api_col2 = st.columns([2, 1])
+    with api_col1:
+        vessel_name = st.text_input(
+            "Vessel",
+            placeholder="Type exact vessel name",
+            help="Required before API loading. This keeps the API call light.",
+        ).strip()
+    with api_col2:
+        vessel_field = st.text_input(
+            "API vessel field",
+            value="ShipName",
+            help="Change only if the API uses another vessel column name, e.g. VesselName.",
+        ).strip()
+
+    today_date = date.today()
+    api_start_date = today_date - timedelta(days=4)
+    api_end_date = today_date
+    st.caption(f"API data window: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}, based on today.")
+
+    if "api_force_refresh_token" not in st.session_state:
+        st.session_state["api_force_refresh_token"] = 0
+
+    if st.button("Refresh API data", type="primary", use_container_width=True):
+        st.session_state.pop("api_uploaded_files", None)
+        st.session_state.pop("api_loaded_vessel", None)
+        st.session_state.pop("api_loaded_window", None)
+
+        if not api_base_url:
+            st.warning("Please enter the API endpoint before refreshing API data.")
+            st.stop()
+
+        if not vessel_name:
+            st.warning("Please select/type a vessel before refreshing API data.")
+            st.stop()
+
+        if not vessel_field:
+            st.warning("Please enter the API vessel field before refreshing API data.")
+            st.stop()
+
+        st.session_state["api_force_refresh_token"] += 1
+
+        try:
+            with st.spinner("Fetching latest 5 days from API..."):
+                api_df = fetch_api_noon_reports_last_5_days(
+                    api_base_url,
+                    vessel_name,
+                    vessel_field,
+                    today_date,
+                    st.session_state["api_force_refresh_token"],
+                )
+
+            if api_df.empty:
+                st.warning(f"No report found for {vessel_name} during the latest 5 calendar days.")
+                st.stop()
+
+            st.success(f"Fetched {len(api_df):,} API rows for {vessel_name} from the latest 5 calendar days.")
+            st.dataframe(api_df.head(50), use_container_width=True, hide_index=True)
+
+            api_excel = dataframe_to_excel_bytes(api_df)
+            api_file = ApiUploadedFile(
+                name=f"API_{vessel_name}_latest_5_days.xlsx",
+                data=api_excel.getvalue(),
+            )
+
+            st.session_state["api_uploaded_files"] = [api_file]
+            st.session_state["api_loaded_vessel"] = vessel_name
+            st.session_state["api_loaded_window"] = f"{api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}"
+
+        except Exception as exc:  # noqa: BLE001 - show user-facing API errors in Streamlit
+            st.error(f"API fetch failed: {exc}")
+            st.stop()
+
+    if st.session_state.get("api_loaded_vessel") == vessel_name:
+        uploaded_files = st.session_state.get("api_uploaded_files", [])
+        loaded_window = st.session_state.get("api_loaded_window")
+        if uploaded_files and loaded_window:
+            st.caption(f"Loaded API data: {vessel_name} | {loaded_window}")
+    else:
+        uploaded_files = []
 
 with st.expander("Validation rules included", expanded=False):
     st.dataframe(pd.DataFrame(RULES), use_container_width=True, hide_index=True)
 
 if not uploaded_files:
-    st.info("Upload an ANTHEA-style noon report Excel file to start.")
+    if source_option == "File upload":
+        st.info("Upload an ANTHEA-style noon report Excel file to start.")
+    else:
+        st.info("Select a vessel and refresh API data to start.")
     st.stop()
 
 run = st.button("Run validation", type="primary", use_container_width=True)
