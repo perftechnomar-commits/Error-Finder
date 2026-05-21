@@ -254,10 +254,10 @@ with st.sidebar:
     recent_days = st.number_input(
         "Recent problem table: last N report days",
         min_value=1,
-        max_value=14,
-        value=2,
+        max_value=5,
+        value=5,
         step=1,
-        help="Display filter only. It does not rerun validation.",
+        help="Display filter only. The operational source is expected to cover the latest 5 report days.",
     )
 
     with st.expander("Validation rule scope", expanded=True):
