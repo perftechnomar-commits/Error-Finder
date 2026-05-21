@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from io import BytesIO
+import re
 
 import altair as alt
 import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -20,6 +22,7 @@ API_VESSEL_FIELD = "ShipName"
 API_HEADERS = {"Accept": "application/json"}
 VESSEL_LIST_LOOKBACK_DAYS = 60  # lightweight dropdown lookup window; full report fetch remains latest 5 days
 VESSEL_LIST_MAX_PAGES = 5       # safety guard against heavy OData pagination
+REPORT_DATA_MAX_PAGES = 20         # one vessel / latest 5 days, but ReportData is long-format and may be paginated
 
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
@@ -269,7 +272,7 @@ def fetch_api_noon_reports_last_5_days(
     today_date: date,
     force_refresh_token: int = 0,
 ) -> pd.DataFrame:
-    """Fetch all API columns for one vessel, limited to the latest 5 calendar days."""
+    """Fetch raw long-format ReportData rows for one vessel, limited to the latest 5 calendar days."""
     del force_refresh_token  # Used only to intentionally break cache when Refresh API data is pressed.
 
     start_date = today_date - timedelta(days=4)
@@ -286,16 +289,461 @@ def fetch_api_noon_reports_last_5_days(
         "$format": "json",
     }
 
-    response = requests.get(
-        base_url,
-        params=params,
-        auth=get_marorka_auth(),
-        headers=API_HEADERS,
-        timeout=60,
+    all_rows: list[dict] = []
+    next_url: str | None = None
+
+    for page_no in range(REPORT_DATA_MAX_PAGES):
+        if page_no == 0:
+            response = requests.get(
+                base_url,
+                params=params,
+                auth=get_marorka_auth(),
+                headers=API_HEADERS,
+                timeout=60,
+            )
+        else:
+            if not next_url:
+                break
+            response = requests.get(
+                next_url,
+                auth=get_marorka_auth(),
+                headers=API_HEADERS,
+                timeout=60,
+            )
+
+        payload = read_odata_json(response, "Report data request")
+        all_rows.extend(parse_odata_rows(payload))
+
+        next_url = get_odata_next_link(payload)
+        if not next_url:
+            break
+
+    return pd.DataFrame(all_rows)
+
+
+def clean_odata_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove OData metadata/navigation columns that break pivoting and Excel export."""
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    metadata_cols = [c for c in out.columns if str(c).startswith("__") or str(c).startswith("@odata")]
+    complex_cols = [
+        c
+        for c in out.columns
+        if out[c].map(lambda x: isinstance(x, (dict, list))).any()
+    ]
+    return out.drop(columns=list(dict.fromkeys(metadata_cols + complex_cols)), errors="ignore")
+
+
+def parse_possible_odata_datetime(series: pd.Series) -> pd.Series:
+    """Parse ISO-like and Microsoft JSON OData date values."""
+    as_text = series.astype(str)
+    ms_match = as_text.str.extract(r"/Date\(([-]?\d+)")
+
+    parsed = pd.to_datetime(series, errors="coerce")
+    has_ms = ms_match[0].notna()
+    if has_ms.any():
+        parsed.loc[has_ms] = pd.to_datetime(ms_match.loc[has_ms, 0].astype("int64"), unit="ms", errors="coerce")
+
+    try:
+        return parsed.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        return parsed
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Convert values to numeric while tolerating commas, blanks, and API text values."""
+    if series is None:
+        return pd.Series(dtype="float64")
+    cleaned = series.astype(str).str.strip().replace({"": np.nan, "None": np.nan, "nan": np.nan})
+    cleaned = cleaned.str.replace(",", "", regex=False)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Create missing columns as NA so calculations do not collapse when a report type lacks fields."""
+    for col in cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+
+def convert_numeric_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = to_number(df[col])
+    return df
+
+
+def row_sum(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    existing = [c for c in cols if c in df.columns]
+    if not existing:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    return df[existing].apply(pd.to_numeric, errors="coerce").sum(axis=1, min_count=1)
+
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    den = pd.to_numeric(denominator, errors="coerce").replace({0: np.nan})
+    return pd.to_numeric(numerator, errors="coerce") / den
+
+
+def round_if_present(df: pd.DataFrame, cols: list[str], decimals: int = 3) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(decimals)
+    return df
+
+
+def transform_api_reportdata_like_power_query(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Replicate the Excel Power Query shaping used before file upload.
+
+    The API returns ReportData in long format, with one row per ReportId / ValueDescription.
+    The uploaded Excel files were already refreshed/transformed in Excel and contained the wide
+    Table sheet. This function creates that same wide table inside Streamlit before validation.
+    """
+    if raw_df.empty:
+        return raw_df.copy()
+
+    df = clean_odata_metadata(raw_df)
+
+    removed_cols = [
+        "Voyage", "Ports", "Report", "VariableName", "CompanyName", "PortCode",
+        "VoyageId", "VoyageIdInternal", "MeasuredValue", "ValueUnit", "EndDateTimeLT",
+        "StartDateTimeLT", "IMONo", "Id",
+    ]
+    df = df.drop(columns=[c for c in removed_cols if c in df.columns], errors="ignore")
+
+    if {"ValueDescription", "ReportedValue"}.issubset(df.columns):
+        df = df[df["ValueDescription"].notna()].copy()
+        if "ReportType" in df.columns:
+            df = df[~df["ReportType"].isin(["Intake Report", "Fuel Change Report"])].copy()
+
+        index_cols = [c for c in df.columns if c not in ["ValueDescription", "ReportedValue"]]
+        df = (
+            df.pivot_table(
+                index=index_cols,
+                columns="ValueDescription",
+                values="ReportedValue",
+                aggfunc="first",
+                dropna=False,
+            )
+            .reset_index()
+        )
+        df.columns.name = None
+
+    date_cols = [
+        "StartDateTimeGMT", "EndDateTimeGMT",
+        "ETA to Next Port  [dd:mm:yyyy hh:mm]",
+        "Estimated Time of Berthing [dd:mm:yyyy hh:mm]",
+        "ETD [dd:mm:yyyy hh:mm]",
+        "Pilot Onboard Time [dd:mm:yyyy hh:mm]",
+        "SBE for Departure Time [dd:mm:yyyy hh:mm]",
+        "Finished With Engine Time [dd:mm:yyyy hh:mm]",
+        "Commenced Cargo Operation Time [dd:mm:yyyy hh:mm]",
+        "Completed Cargo Operation Time [dd:mm:yyyy hh:mm]",
+        "Full Away Time  [dd:mm:yyyy hh:mm]",
+    ]
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = parse_possible_odata_datetime(df[col])
+
+    me_fuel_cols = [
+        "Main Engine - HSHFO", "Main Engine - HSLFO", "Main Engine - MGO",
+        "Main Engine - ULSHFO", "Main Engine - ULSLFO", "Main Engine - VLSHFO",
+        "Main Engine - VLSLFO",
+    ]
+    dg_fuel_cols = [
+        "Diesel Generator - HSHFO", "Diesel Generator - HSLFO", "Diesel Generator - MGO",
+        "Diesel Generator - ULSHFO", "Diesel Generator - ULSLFO", "Diesel Generator - VLSHFO",
+        "Diesel Generator - VLSLFO",
+    ]
+    boiler_fuel_cols = [
+        "Boiler - HSHFO", "Boiler - HSLFO", "Boiler - MGO",
+        "Boiler - ULSHFO", "Boiler - ULSLFO", "Boiler - VLSHFO", "Boiler - VLSLFO",
+    ]
+    rob_cols = [
+        "ROB_HSHFO", "ROB_HSLFO", "ROB_MGO", "ROB_ULSHFO",
+        "ROB_ULSLFO", "ROB_VLSHFO", "ROB_VLSLFO", "ROB_Cylinder Oil",
+    ]
+    base_numeric_cols = [
+        "LapTime", "Draft Aft [m] (m)", "Draft Forward [m] (m)",
+        "Calculated Draft Forward [m]", "Calculated Draft Aft [m]", "Calculated Mean Draft [m]",
+        "Trim [m]", "Slip Average [%]", "Shaft 1 RPM (rpm)",
+        "Engine Distance [nm]", "Distance Over Ground [nm]", "Distance Through Water [nm]",
+        "Miles to Go [nm]", "Total Miles Over Ground from COSP [nm]", "Voyage Total Distance [nm]",
+        "Voyage Average RPM", "Voyage Average Speed [kn]", "ME Load [%MCR]",
+        "Swell Height [m]", "Wind Speed [bft]", "Current Speed [kn]",
+        "Speed over ground [kn GPS] (kn)", "Water speed [kn Log] (kn)", "Required Speed [kn]",
+        "Speed Ordered by the Charterers [kn]", "Total DG Power [kW] (kW)",
+        "DG1 Power [kW] (kW)", "DG2 Power [kW] (kW)", "DG3 Power [kW] (kW)", "DG4 Power [kW] (kW)",
+        "Shaft Generator Power [kW]", "Electricity Delivered Through OPS [MJ]",
+        "DG1 Running Hours [hh:mm]", "DG2 Running Hours [hh:mm]", "DG3 Running Hours [hh:mm]",
+        "DG4 Running Hours [hh:mm]", "Shaft Generator Running Hours [hh:mm]",
+        "DG1 Load [% MCR]", "DG2 Load [% MCR]", "DG3 Load [% MCR]", "DG4 Load [% MCR]",
+        "ME Rev Since Last Report", "MELO ROB [ltr]", "MELO Received [ltr]",
+        "Cylinder Oil 1 ROB [ltr]", "Cylinder Oil 1 Received [ltr]",
+        "Cylinder Oil 2 ROB [ltr]", "Cylinder Oil 2 Received [ltr]",
+        "GELO Grade ROB [ltr]", "GELO Received [ltr]", "Load from AMS [kW]",
+        "Power from Torque Meter [kW]", "Sea Load [kW]", "20ft Reefer Units", "40ft Reefer Units",
+        "Total Number Reefer Units (20 and 40ft)", "Reefer Power [kW]", "Reefer Energy [kWh]",
+        "Average Power per Reefer [kW]", "Bilge Water Produced [cbm]",
+        "Bilge Water Disposed Through OWS [cbm]", "Bilge Water ROB [cbm]", "FW Consumed [cbm]",
+        "Sludge Produced [cbm]", "Sludge ROB [cbm]", "Sludge Disposed [cbm]",
+        "Sludge Incinerated / Evaporated [cbm]", "Sulphur Content [%]", "FW Produced [cbm]",
+        "FW ROB [cbm]", "FW Received [cbm]", "Garbage Disposed [cbm]",
+        "ME Exhaust Gas Temp Min [Deg C]", "ME Exhaust Gas Temp Max [Deg C]",
+        "Engine Room Temperature [Deg C]", "Central Coolers FW Outlet Temp [Deg C]",
+        "ME Lub Oil Inlet Temp [Deg C]", "Turbochargers Average RPM",
+        "Scavenge Air Press [kg/cm2]", "Scavenge Air Temp [Deg C]",
+        "Air Cooler Air Press Drop [mmWC]", "Jacket Cooling Out [Deg C]",
+        "ME Rev Counter", "Load from RPLS or Alphalub [kW]", "Seawater Temperature [Deg C]",
+        "Load Indicator", "Calorific Value [MJ/kg]", "ME Sump Tank Quantity [cbm]",
+        "Water Density [kg/cbm]", "Total Number DG Units (20 and 40ft)",
+        "DG Units Weight [tons]", "Reefer Units Weight [tons]",
+        "Total Units Weight (All Categories)", "Total Units Onboard (All Categories)",
+        "TEU Discharged Weight [tons]", "TEU Discharged Units", "FEU Discharged Weight [tons]",
+        "FEU Discharged Units", "TEU Loaded Weight [tons]", "TEU Loaded Units",
+        "FEU Loaded Weight [tons]", "FEU Loaded Units", "Reefers Discharged Weight [tons]",
+        "Reefers Discharged Units", "Reefers Loaded Weight [tons]", "Reefers Loaded Units",
+        "20ft Empty Units Weight [tons]", "20ft Empty Units", "40ft Empty Units Weight [tons]",
+        "40ft Empty Units", "Total Number Empty Units (20 and 40ft)",
+        "Total Empty Units Weight (20 and 40ft) [tons]", "20ft Full Units Weight [tons]",
+        "20ft Full Units", "40ft Full Units Weight [tons]", "40ft Full Units",
+        "Total Number Full Units (20 and 40ft)", "Total Full Units Weight (20 and 40ft) [tons]",
+        "48/54ft Units Weight [tons]", "48/54ft Units", "Displacement [tons]",
+        "Cargo Weight [tons]", "Dead Load [tons]", "Bending Moments [%]",
+        "Shearing Forces [%]", "Torsional Moments [%]", "Drifting Time [hh:mm]",
+        "Total Drifting Time in Voyage [hh:mm]", "AMP Hours [hh:mm]", "AMP Energy [kWh]",
+        "Total 20ft Units Weight (Full and Empty)", "Total Number of 20ft Units (Full and Empty)",
+        "Total 40 ft Units Weight (Full and Empty)", "Total Number of 40ft Units (Full and Empty)",
+        "20ft DG Units", "40ft DG Units", "Heading [COG] [0 - 360°] (°)",
+        "GM [m]", "Anchoring Time [hh:mm]", "Air Draft [m]", "Under Keel Clearance [m]",
+        "Ballast Amount [tons]", "Observed Draft Aft [m]", "Observed Draft Forward [m]",
+        "Observed Mean Draft [m]", "Additional Tugs In", "Additional Tugs Out",
+        "Tugs Compulsory In", "Tugs Compulsory Out", "Tugs Used In", "Tugs Used Out",
+        "Substitute Source Energy Consumed [MJ]",
+    ]
+
+    calculation_required_cols = (
+        me_fuel_cols + dg_fuel_cols + boiler_fuel_cols + rob_cols +
+        [
+            "Draft Forward [m] (m)", "Draft Aft [m] (m)", "Engine Distance [nm]",
+            "Distance Over Ground [nm]", "Shaft 1 RPM (rpm)", "LapTime",
+            "Power from Torque Meter [kW]", "ME Rev Since Last Report",
+            "Speed over ground [kn GPS] (kn)", "Water speed [kn Log] (kn)",
+            "Total DG Power [kW] (kW)", "DG1 Running Hours [hh:mm]",
+            "DG2 Running Hours [hh:mm]", "DG3 Running Hours [hh:mm]",
+            "DG4 Running Hours [hh:mm]", "Shaft Generator Running Hours [hh:mm]",
+            "20ft Reefer Units", "40ft Reefer Units",
+        ]
+    )
+    df = ensure_columns(df, list(dict.fromkeys(calculation_required_cols)))
+    df = convert_numeric_columns(df, list(dict.fromkeys(base_numeric_cols + me_fuel_cols + dg_fuel_cols + boiler_fuel_cols + rob_cols)))
+
+    df["Average Draft [m]"] = df[["Draft Forward [m] (m)", "Draft Aft [m] (m)"]].mean(axis=1).round(3)
+    df["Calculated Slip"] = (1 - safe_divide(df["Distance Over Ground [nm]"], df["Engine Distance [nm]"])).round(3)
+    df["Corrected Speed for 7% Slip"] = (df["Shaft 1 RPM (rpm)"] * 0.030123 * 10.5041).round(3)
+
+    df["Consumption ME 24 Hours"] = safe_divide(row_sum(df, me_fuel_cols) * 24, df["LapTime"]).round(3)
+    df["Consumption DGs 24 Hours"] = safe_divide(row_sum(df, dg_fuel_cols) * 24, df["LapTime"]).round(3)
+    df["Consumption Boiler 24 Hours"] = safe_divide(row_sum(df, boiler_fuel_cols) * 24, df["LapTime"]).round(3)
+    df["Total Consumption 24 Hours"] = row_sum(
+        df, ["Consumption ME 24 Hours", "Consumption DGs 24 Hours", "Consumption Boiler 24 Hours"]
+    ).round(3)
+
+    df["SFOC [gr/Kwh]"] = safe_divide(df["Consumption ME 24 Hours"], df["Power from Torque Meter [kW]"]) / 2.4e-05
+    df["SFOC [gr/Kwh]"] = df["SFOC [gr/Kwh]"].replace([np.inf, -np.inf], np.nan).fillna(0).round(3)
+
+    hfo_equivalent_cols = [
+        "Main Engine - HSHFO", "Diesel Generator - HSHFO", "Boiler - HSHFO",
+        "Main Engine - VLSHFO", "Diesel Generator - VLSHFO", "Boiler - VLSHFO",
+        "Main Engine - ULSHFO", "Diesel Generator - ULSHFO", "Boiler - ULSHFO",
+    ]
+    lfo_equivalent_cols = [
+        "Main Engine - HSLFO", "Diesel Generator - HSLFO", "Boiler - HSLFO",
+        "Main Engine - VLSLFO", "Diesel Generator - VLSLFO", "Boiler - VLSLFO",
+        "Main Engine - ULSLFO", "Diesel Generator - ULSLFO", "Boiler - ULSLFO",
+    ]
+    mgo_equivalent_cols = ["Main Engine - MGO", "Diesel Generator - MGO", "Boiler - MGO"]
+    df["Total HFO Equivalent"] = row_sum(df, hfo_equivalent_cols)
+    df["Total LFO Equivalent"] = row_sum(df, lfo_equivalent_cols) / 0.9481
+    df["Total MGO Equivalent"] = row_sum(df, mgo_equivalent_cols) / 0.9415
+    df[["Total HFO Equivalent", "Total LFO Equivalent", "Total MGO Equivalent"]] = df[
+        ["Total HFO Equivalent", "Total LFO Equivalent", "Total MGO Equivalent"]
+    ].round(3)
+    df["HFO Consumption Equivalent"] = row_sum(df, ["Total HFO Equivalent", "Total LFO Equivalent", "Total MGO Equivalent"]).round(3)
+
+    df["Engine Miles Calculated [RPM]"] = (df["Shaft 1 RPM (rpm)"] * 0.032397 * df["LapTime"] * 10.5041).round(3)
+    df["Engine Miles Calculated [RPM]"] = df["Engine Miles Calculated [RPM]"].fillna(0)
+    df["Engine Miles Calculated [Rev]"] = (safe_divide(df["ME Rev Since Last Report"], pd.Series(1852, index=df.index)) * 10.5041).round(3)
+
+    speed_diff = df["Water speed [kn Log] (kn)"] - df["Speed over ground [kn GPS] (kn)"]
+    state_series = df["StateName"].astype(str) if "StateName" in df.columns else pd.Series("", index=df.index)
+    df["Current Speed Calculated"] = np.where(state_series.eq("Sea Passage"), speed_diff, np.nan)
+    df["Current Speed Calculated"] = pd.to_numeric(df["Current Speed Calculated"], errors="coerce").fillna(0).round(3)
+
+    dg_hours_sum = row_sum(
+        df,
+        [
+            "DG1 Running Hours [hh:mm]", "DG2 Running Hours [hh:mm]",
+            "DG3 Running Hours [hh:mm]", "DG4 Running Hours [hh:mm]",
+            "Shaft Generator Running Hours [hh:mm]",
+        ],
+    )
+    df["Load per Generator Calculated"] = (safe_divide(df["Total DG Power [kW] (kW)"], dg_hours_sum) * df["LapTime"]).round(3)
+    df["Load per Generator %"] = safe_divide(df["Load per Generator Calculated"], pd.Series(2900, index=df.index)).round(3)
+
+    df["Reefers Onboard 20ft Equivalent"] = (row_sum(df, ["20ft Reefer Units", "40ft Reefer Units"]) * 1.66).fillna(0).round(3)
+    df["Estimated Reefer Load"] = (df["Reefers Onboard 20ft Equivalent"] * 3).round(3)
+
+    corrected_speed = df["Corrected Speed for 7% Slip"]
+    df["For Corrected Speed CP Consumption is"] = (
+        corrected_speed.pow(3) * 0.0175140
+        + corrected_speed.pow(2) * -0.2802647
+        + corrected_speed * 2.9803035
+    ).round(3).fillna(0)
+    df["Difference from Actual"] = df["For Corrected Speed CP Consumption is"] - df["Consumption ME 24 Hours"]
+    df["Difference Percentage"] = np.where(
+        df["For Corrected Speed CP Consumption is"] > 0,
+        1 - safe_divide(df["For Corrected Speed CP Consumption is"], df["Consumption ME 24 Hours"]),
+        np.nan,
     )
 
-    rows = parse_odata_rows(read_odata_json(response, "Report data request"))
-    return pd.DataFrame(rows)
+    corrected_speed_plus = corrected_speed + 0.5
+    df["For Corrected Speed with + 0.5 kn for on about CP Consumption is"] = (
+        corrected_speed_plus.pow(3) * 0.0175140
+        + corrected_speed_plus.pow(2) * -0.2802647
+        + corrected_speed_plus * 2.9803035
+    ).round(3).fillna(0)
+    df["Difference from Actual2"] = df["For Corrected Speed with + 0.5 kn for on about CP Consumption is"] - df["Consumption ME 24 Hours"]
+    df["Difference Percentage2"] = np.where(
+        df["For Corrected Speed with + 0.5 kn for on about CP Consumption is"] > 0,
+        1 - safe_divide(df["For Corrected Speed with + 0.5 kn for on about CP Consumption is"], df["Consumption ME 24 Hours"]),
+        np.nan,
+    )
+
+    df["For Corrected Speed with + 0.5 kn + 5% for both on abouts CP Consumption is"] = (
+        df["For Corrected Speed with + 0.5 kn for on about CP Consumption is"] * 1.05
+    ).round(3)
+    df["Difference from Actual3"] = (
+        df["For Corrected Speed with + 0.5 kn + 5% for both on abouts CP Consumption is"] - df["Consumption ME 24 Hours"]
+    ).round(3)
+    df["Difference Percentage3"] = np.where(
+        df["For Corrected Speed with + 0.5 kn + 5% for both on abouts CP Consumption is"] > 0,
+        1 - safe_divide(
+            df["For Corrected Speed with + 0.5 kn + 5% for both on abouts CP Consumption is"],
+            df["Total Consumption 24 Hours"],
+        ),
+        np.nan,
+    )
+
+    pct_divide_cols = [
+        "Slip Average [%]", "ME Load [%MCR]", "DG1 Load [% MCR]", "DG2 Load [% MCR]",
+        "DG3 Load [% MCR]", "DG4 Load [% MCR]", "Bending Moments [%]",
+        "Shearing Forces [%]", "Torsional Moments [%]",
+    ]
+    for col in pct_divide_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce") / 100
+
+    df = round_if_present(
+        df,
+        [
+            "Difference from Actual", "Difference Percentage", "Difference from Actual2",
+            "Difference Percentage2", "Difference Percentage3", "Calculated Slip",
+            "Corrected Speed for 7% Slip", "Average Draft [m]",
+        ],
+        3,
+    )
+
+    rename_map = {
+        "ReportType": "Report Type",
+        "StartDateTimeGMT": "Start Date & Time GMT",
+        "EndDateTimeGMT": "End Date & Time GMT",
+        "LapTime": "Time Since Last Report",
+        "StateName": "State Name",
+        "ETD [dd:mm:yyyy hh:mm]": "Estimated Time of Departure [dd:mm:yyyy hh:mm]",
+        "ETA to Next Port  [dd:mm:yyyy hh:mm]": "Estimated Time of Arrival to Next Port  [dd:mm:yyyy hh:mm]",
+        "Draft Forward [m] (m)": "Draft Forward [m]",
+        "Draft Aft [m] (m)": "Draft Aft [m]",
+        "Shaft 1 RPM (rpm)": "ME Shaft RPM [RPM]",
+        "Consumption ME 24 Hours": "Consumption ME 24 Hours [MT]",
+        "Consumption DGs 24 Hours": "Consumption DGs 24 Hours [MT]",
+        "Consumption Boiler 24 Hours": "Consumption Boiler 24 Hours [MT]",
+        "Total Consumption 24 Hours": "Total Consumption 24 Hours [MT]",
+        "Main Engine - HSHFO": "Main Engine - HSHFO consumption [MT]",
+        "Diesel Generator - HSHFO": "Diesel Generator - HSHFO consumption [MT]",
+        "Boiler - HSHFO": "Boiler - HSHFO consumption [MT]",
+        "Main Engine - HSLFO": "Main Engine - HSLFO consumption [MT]",
+        "Diesel Generator - HSLFO": "Diesel Generator - HSLFO consumption [MT]",
+        "Boiler - HSLFO": "Boiler - HSLFO consumption [MT]",
+        "Main Engine - MGO": "Main Engine - MGO consumption [MT]",
+        "Diesel Generator - MGO": "Diesel Generator - MGO consumption [MT]",
+        "Boiler - MGO": "Boiler - MGO consumption [MT]",
+        "Main Engine - ULSHFO": "Main Engine - ULSHFO consumption [MT]",
+        "Diesel Generator - ULSHFO": "Diesel Generator - ULSHFO consumption [MT]",
+        "Boiler - ULSHFO": "Boiler - ULSHFO consumption [MT]",
+        "Main Engine - ULSLFO": "Main Engine - ULSLFO consumption [MT]",
+        "Diesel Generator - ULSLFO": "Diesel Generator - ULSLFO consumption [MT]",
+        "Boiler - ULSLFO": "Boiler - ULSLFO consumption [MT]",
+        "Main Engine - VLSHFO": "Main Engine - VLSHFO consumption [MT]",
+        "Diesel Generator - VLSHFO": "Diesel Generator - VLSHFO consumption [MT]",
+        "Boiler - VLSHFO": "Boiler - VLSHFO consumption [MT]",
+        "Main Engine - VLSLFO": "Main Engine - VLSLFO consumption [MT]",
+        "Diesel Generator - VLSLFO": "Diesel Generator - VLSLFO consumption [MT]",
+        "Boiler - VLSLFO": "Boiler - VLSLFO consumption [MT]",
+        "ROB_HSHFO": "ROB HSHFO [MT]",
+        "ROB_HSLFO": "ROB HSLFO [MT]",
+        "ROB_MGO": "ROB MGO [MT]",
+        "ROB_ULSHFO": "ROB ULSHFO [MT]",
+        "ROB_ULSLFO": "ROB ULSLFO [MT]",
+        "ROB_VLSHFO": "ROB VLSHFO [MT]",
+        "ROB_VLSLFO": "ROB VLSLFO [MT]",
+        "ROB_Cylinder Oil": "ROB Cylinder Oil [MT]",
+        "HFO Consumption Equivalent": "HFO Consumption Equivalent [MT]",
+        "Current Speed Calculated": "Current Speed Calculated [kn]",
+        "Water speed [kn Log] (kn)": "Speed Through Water [kn Log]",
+        "Speed over ground [kn GPS] (kn)": "Speed over ground [kn GPS]",
+        "Total DG Power [kW] (kW)": "Total DG Power [kW]",
+        "DG1 Power [kW] (kW)": "DG1 Power [kW]",
+        "DG2 Power [kW] (kW)": "DG2 Power [kW]",
+        "DG3 Power [kW] (kW)": "DG3 Power [kW]",
+        "DG4 Power [kW] (kW)": "DG4 Power [kW]",
+        "Load per Generator %": "Load per Generator [% MCR]",
+        "Total Number Reefer Units (20 and 40ft)": "Total Number Reefer Units (20ft and 40ft)",
+        "Ships Alongside": "Ship Alongside",
+        "Total Number DG Units (20 and 40ft)": "Total Number DG Units (20ft and 40ft)",
+        "Total Number Empty Units (20 and 40ft)": "Total Number Empty Units (20ft and 40ft)",
+        "Total Empty Units Weight (20 and 40ft) [tons]": "Total Empty Units Weight (20ft and 40ft) [tons]",
+        "Total Number Full Units (20 and 40ft)": "Total Number Full Units (20ft and 40ft)",
+        "Total Full Units Weight (20 and 40ft) [tons]": "Total Full Units Weight (20ft and 40ft) [tons]",
+        "Heading [COG] [0 - 360°] (°)": "Heading [COG] [0 - 360°]",
+    }
+    df = df.rename(columns=rename_map)
+
+    for col in ["Difference Percentage", "Difference Percentage2", "Difference Percentage3"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").replace(0, np.nan)
+
+    drop_after_calc = ["Total HFO Equivalent", "Total LFO Equivalent", "Total MGO Equivalent"]
+    df = df.drop(columns=[c for c in drop_after_calc if c in df.columns], errors="ignore")
+
+    preferred_start_cols = [
+        "ReportId", "ShipName", "Report Type", "Start Date & Time GMT", "End Date & Time GMT",
+        "Time Since Last Report", "State Name", "Position (HHMMSS)", "Voyage Number",
+        "Estimated Time of Arrival to Next Port  [dd:mm:yyyy hh:mm]",
+        "Estimated Time of Berthing [dd:mm:yyyy hh:mm]",
+        "Estimated Time of Departure [dd:mm:yyyy hh:mm]",
+        "Steaming Time Since Last Report [hh:mm]", "Draft Forward [m]", "Draft Aft [m]",
+        "Average Draft [m]", "Trim [m]", "Slip Average [%]", "Calculated Slip",
+        "ME Shaft RPM [RPM]", "Corrected Speed for 7% Slip",
+        "Consumption ME 24 Hours [MT]", "Consumption DGs 24 Hours [MT]",
+        "Consumption Boiler 24 Hours [MT]", "Total Consumption 24 Hours [MT]",
+    ]
+    ordered = [c for c in preferred_start_cols if c in df.columns]
+    rest = [c for c in df.columns if c not in ordered]
+    return df[ordered + rest]
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> BytesIO:
@@ -372,7 +820,7 @@ if source_option == "File upload":
 
 else:
     st.info(
-        "API mode fetches all report columns only after one vessel is selected. "
+        "API mode fetches raw ReportData only after one vessel is selected, then reshapes it like the Excel Power Query table. "
         "The validation data window remains the latest 5 calendar days."
     )
 
@@ -465,10 +913,20 @@ else:
                 st.warning(f"No report found for {vessel_name} during the latest 5 calendar days.")
                 st.stop()
 
-            st.success(f"Fetched {len(api_df):,} API rows for {vessel_name} from the latest 5 calendar days.")
-            st.dataframe(api_df.head(50), use_container_width=True, hide_index=True)
+            transformed_api_df = transform_api_reportdata_like_power_query(api_df)
+            if transformed_api_df.empty:
+                st.warning(
+                    f"API returned raw rows for {vessel_name}, but no validation-ready report rows remained after the Excel-like transformation."
+                )
+                st.stop()
 
-            api_excel = dataframe_to_excel_bytes(api_df)
+            st.success(
+                f"Fetched {len(api_df):,} raw API rows and prepared {len(transformed_api_df):,} report row(s) "
+                f"for {vessel_name} from the latest 5 calendar days."
+            )
+            st.dataframe(transformed_api_df.head(50), use_container_width=True, hide_index=True)
+
+            api_excel = dataframe_to_excel_bytes(transformed_api_df)
             api_file = ApiUploadedFile(
                 name=f"API_{vessel_name}_latest_5_days.xlsx",
                 data=api_excel.getvalue(),
