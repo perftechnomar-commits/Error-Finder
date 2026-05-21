@@ -143,7 +143,7 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Validation cache / rule scope helpers
+# Validation cache / dashboard rule-filter helpers
 # -----------------------------------------------------------------------------
 
 def build_source_signature(uploaded_files: list) -> tuple:
@@ -219,8 +219,8 @@ def build_portfolio_summary(checked_rows_df: pd.DataFrame, errors_df: pd.DataFra
     )
 
 
-def apply_validation_rule_scope(combined_result: dict, selected_rules: list[str]) -> dict:
-    """Apply the selected validation rule scope to combined validation output."""
+def apply_rule_display_filter(combined_result: dict, selected_rules: list[str]) -> dict:
+    """Apply the selected rule filter to displayed dashboard output only."""
     scoped = dict(combined_result)
     errors_raw = combined_result["errors"].copy()
     checked_rows_raw = combined_result["checked_rows"].copy()
@@ -277,15 +277,15 @@ with st.sidebar:
         help="Display filter only. It scopes the dashboard to the latest N report dates from the loaded file and does not rerun validation.",
     )
 
-    with st.expander("Validation rule scope", expanded=True):
+    with st.expander("Rule filter", expanded=True):
         rule_options = get_rule_options()
         default_rules = [rule for rule in rule_options if "sludge" not in rule.lower()]
 
         selected_rules = st.multiselect(
-            "Rules to validate",
+            "Rules to show",
             options=rule_options,
             default=default_rules,
-            help="All rules are selected by default except sludge-related rules. Changing this requires pressing Run validation again.",
+            help="Display filter only. Validation runs all rules once; changing this updates the dashboard without rerunning validation.",
         )
 
 
@@ -333,14 +333,12 @@ if not uploaded_files:
 
 current_source_signature = build_source_signature(uploaded_files)
 current_config_signature = build_config_signature(config)
-current_rule_signature = tuple(selected_rules)
 
 for key, default in {
     "validation_combined": None,
     "validation_failed": [],
     "validation_source_signature": None,
     "validation_config_signature": None,
-    "validation_rule_signature": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -364,18 +362,18 @@ if run:
     progress.empty()
 
     if all_results:
-        raw_combined = combine_results(all_results)
-        st.session_state["validation_combined"] = apply_validation_rule_scope(raw_combined, selected_rules)
+        # Store the full validation result.
+        # Rule selection is applied later as a dashboard filter, without rerunning validation.
+        st.session_state["validation_combined"] = combine_results(all_results)
         st.session_state["validation_source_signature"] = current_source_signature
         st.session_state["validation_config_signature"] = current_config_signature
-        st.session_state["validation_rule_signature"] = current_rule_signature
     else:
         st.session_state["validation_combined"] = None
 
     st.session_state["validation_failed"] = failed
 
 if st.session_state["validation_combined"] is None:
-    st.info("Run validation once. After that, vessel/report/rule display filters work without rerunning validation.")
+    st.info("Run validation once. After that, vessel/day/rule/report filters work without rerunning validation.")
     st.stop()
 
 if st.session_state["validation_source_signature"] != current_source_signature:
@@ -385,15 +383,13 @@ if st.session_state["validation_source_signature"] != current_source_signature:
 if st.session_state["validation_config_signature"] != current_config_signature:
     st.info("Validation thresholds changed. Current results still use the previous thresholds. Click Run validation to apply them.")
 
-if st.session_state["validation_rule_signature"] != current_rule_signature:
-    st.info("Validation rule scope changed. Current results still use the previous rule scope. Click Run validation to apply it.")
-
 failed = st.session_state["validation_failed"]
 if failed:
     st.error("Some files could not be validated.")
     st.dataframe(pd.DataFrame(failed), use_container_width=True, hide_index=True)
 
-combined = st.session_state["validation_combined"]
+raw_combined = st.session_state["validation_combined"]
+combined = apply_rule_display_filter(raw_combined, selected_rules)
 summary = combined["portfolio_summary"]
 errors = combined["errors"]
 checked_rows = combined["checked_rows"]
