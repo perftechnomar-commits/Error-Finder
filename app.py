@@ -23,6 +23,7 @@ API_HEADERS = {"Accept": "application/json"}
 VESSEL_LIST_LOOKBACK_DAYS = 365  # dropdown lookup window; full report fetch remains latest 5 days
 VESSEL_LIST_MAX_PAGES = 50      # broader pagination so the dropdown is not limited to the first small API slice
 REPORT_DATA_MAX_PAGES = 20      # one vessel / latest 5 days, but ReportData is long-format and may be paginated
+ODATA_PAGE_SIZE = 5000          # used with $top/$skip when the API does not provide nextLink
 
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
@@ -31,6 +32,25 @@ def parse_report_datetime(series: pd.Series) -> pd.Series:
         return pd.Series(dtype="datetime64[ns]")
     return pd.to_datetime(series, errors="coerce")
 
+
+
+
+def get_existing_report_dates(df: pd.DataFrame) -> list[str]:
+    """Return sorted report dates available in a validation-ready dataframe."""
+    if df is None or df.empty:
+        return []
+
+    date_col = None
+    for candidate in ["Start Date & Time GMT", "StartDateTimeGMT", "start_gmt", "report_datetime"]:
+        if candidate in df.columns:
+            date_col = candidate
+            break
+
+    if date_col is None:
+        return []
+
+    dates = pd.to_datetime(df[date_col], errors="coerce").dt.date.dropna().unique().tolist()
+    return [str(d) for d in sorted(dates)]
 
 def with_report_dates(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy with report_datetime and report_date columns based on start_gmt."""
@@ -227,8 +247,7 @@ def fetch_api_vessel_options(
             f"and StartDateTimeGMT lt DateTime'{end_date:%Y-%m-%d}'"
         ),
         "$select": f"{API_VESSEL_FIELD},StartDateTimeGMT",
-        "$orderby": "StartDateTimeGMT desc",
-        "$top": "5000",
+        "$orderby": f"{API_VESSEL_FIELD} asc,StartDateTimeGMT desc",
         "$format": "json",
     }
 
@@ -236,19 +255,20 @@ def fetch_api_vessel_options(
     next_url: str | None = None
 
     for page_no in range(VESSEL_LIST_MAX_PAGES):
-        if page_no == 0:
+        if next_url:
             response = requests.get(
-                base_url,
-                params=params,
+                next_url,
                 auth=get_marorka_auth(),
                 headers=API_HEADERS,
                 timeout=60,
             )
         else:
-            if not next_url:
-                break
+            page_params = dict(params)
+            page_params["$top"] = str(ODATA_PAGE_SIZE)
+            page_params["$skip"] = str(page_no * ODATA_PAGE_SIZE)
             response = requests.get(
-                next_url,
+                base_url,
+                params=page_params,
                 auth=get_marorka_auth(),
                 headers=API_HEADERS,
                 timeout=60,
@@ -256,10 +276,13 @@ def fetch_api_vessel_options(
 
         payload = read_odata_json(response, "Vessel list request")
         rows = parse_odata_rows(payload)
+        if not rows:
+            break
+
         all_rows.extend(rows)
 
         next_url = normalize_next_link(get_odata_next_link(payload), response.url)
-        if not next_url:
+        if not next_url and len(rows) < ODATA_PAGE_SIZE:
             break
 
     if not all_rows:
@@ -300,29 +323,34 @@ def fetch_api_noon_reports_last_5_days(
     next_url: str | None = None
 
     for page_no in range(REPORT_DATA_MAX_PAGES):
-        if page_no == 0:
-            response = requests.get(
-                base_url,
-                params=params,
-                auth=get_marorka_auth(),
-                headers=API_HEADERS,
-                timeout=60,
-            )
-        else:
-            if not next_url:
-                break
+        if next_url:
             response = requests.get(
                 next_url,
                 auth=get_marorka_auth(),
                 headers=API_HEADERS,
                 timeout=60,
             )
+        else:
+            page_params = dict(params)
+            page_params["$top"] = str(ODATA_PAGE_SIZE)
+            page_params["$skip"] = str(page_no * ODATA_PAGE_SIZE)
+            response = requests.get(
+                base_url,
+                params=page_params,
+                auth=get_marorka_auth(),
+                headers=API_HEADERS,
+                timeout=60,
+            )
 
         payload = read_odata_json(response, "Report data request")
-        all_rows.extend(parse_odata_rows(payload))
+        rows = parse_odata_rows(payload)
+        if not rows:
+            break
+
+        all_rows.extend(rows)
 
         next_url = normalize_next_link(get_odata_next_link(payload), response.url)
-        if not next_url:
+        if not next_url and len(rows) < ODATA_PAGE_SIZE:
             break
 
     return pd.DataFrame(all_rows)
@@ -780,18 +808,27 @@ class ApiUploadedFile:
         return self._data
 
 
+current_source_option = st.session_state.get("source_option", "API")
+
 with st.sidebar:
     st.header("Validation thresholds")
     st.write("Defaults match the ANTHEA Y checker adaptation.")
     config = DEFAULT_CONFIG.copy()
-    recent_days = st.number_input(
-        "Recent problem table: last N report days",
-        min_value=1,
-        max_value=14,
-        value=2,
-        step=1,
-        help="Uses the latest report dates found inside the uploaded Excel, not today's calendar date.",
-    )
+
+    if current_source_option == "File upload":
+        recent_days = st.number_input(
+            "Recent problem table: last N report days",
+            min_value=1,
+            max_value=14,
+            value=2,
+            step=1,
+            help="Uses the latest report dates found inside the uploaded Excel, not today's calendar date.",
+        )
+    else:
+        # API mode already has a fixed latest-5-calendar-day fetch window.
+        # Keep this hidden so the sidebar setting does not confuse or interfere with API usage.
+        recent_days = 5
+        st.caption("API mode uses the latest 5 calendar days. The recent-table day selector is hidden in API mode.")
     with st.expander("Sea passage / performance", expanded=True):
         config["low_steaming_hours"] = st.number_input("Low steaming below hours", value=float(DEFAULT_CONFIG["low_steaming_hours"]), step=0.5)
         config["slip_min"] = st.number_input("Slip min", value=float(DEFAULT_CONFIG["slip_min"]), step=0.01, format="%.2f")
@@ -819,6 +856,7 @@ source_option = st.radio(
     "Choose data source",
     ["API", "File upload"],
     horizontal=True,
+    key="source_option",
     help="Use API for a light latest-5-days check on one vessel. Use upload for multiple vessels or older periods.",
 )
 
@@ -905,7 +943,9 @@ else:
 
     api_start_date = today_date - timedelta(days=4)
     api_end_date = today_date
-    st.caption(f"API data window: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}, based on today.")
+    st.caption(
+        f"API fetch window: latest 5 calendar days, {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d} inclusive, based on today."
+    )
 
     if st.button("Refresh API data", type="primary", use_container_width=True):
         st.session_state.pop("api_file_bytes", None)
@@ -944,9 +984,16 @@ else:
                 )
                 st.stop()
 
+            api_report_dates = get_existing_report_dates(transformed_api_df)
+            api_report_dates_label = ", ".join(api_report_dates) if api_report_dates else "no report dates detected"
+
             st.success(
                 f"Fetched {len(api_df):,} raw API rows and prepared {len(transformed_api_df):,} report row(s) "
                 f"for {vessel_name} from the latest 5 calendar days."
+            )
+            st.caption(
+                f"API window checked: {api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d} inclusive. "
+                f"Report dates actually returned inside that window: {api_report_dates_label}."
             )
             st.dataframe(transformed_api_df.head(50), use_container_width=True, hide_index=True)
 
@@ -954,7 +1001,11 @@ else:
             st.session_state["api_file_bytes"] = api_excel.getvalue()
             st.session_state["api_file_name"] = f"API_{vessel_name}_latest_5_days.xlsx"
             st.session_state["api_loaded_vessel"] = vessel_name
-            st.session_state["api_loaded_window"] = f"{api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d}"
+            st.session_state["api_loaded_window"] = f"{api_start_date:%Y-%m-%d} to {api_end_date:%Y-%m-%d} inclusive"
+            st.session_state["api_loaded_report_dates"] = api_report_dates_label
+            st.session_state["api_raw_rows"] = len(api_df)
+            st.session_state["api_transformed_rows"] = len(transformed_api_df)
+            st.session_state["api_transformed_columns"] = len(transformed_api_df.columns)
 
         except Exception as exc:  # noqa: BLE001 - show user-facing API errors in Streamlit
             st.error(f"API fetch failed: {exc}")
@@ -966,7 +1017,22 @@ else:
         loaded_window = st.session_state.get("api_loaded_window")
         if api_file_bytes and api_file_name and loaded_window:
             uploaded_files = [ApiUploadedFile(name=api_file_name, data=api_file_bytes)]
-            st.caption(f"Loaded API data: {vessel_name} | {loaded_window}")
+            raw_rows = st.session_state.get("api_raw_rows")
+            transformed_rows = st.session_state.get("api_transformed_rows")
+            transformed_cols = st.session_state.get("api_transformed_columns")
+            loaded_report_dates = st.session_state.get("api_loaded_report_dates", "not available")
+            st.caption(
+                f"Loaded API data: {vessel_name} | API window: {loaded_window} | "
+                f"report dates found: {loaded_report_dates} | raw rows: {raw_rows:,} | "
+                f"validation-ready rows: {transformed_rows:,} | columns: {transformed_cols:,}"
+            )
+            st.download_button(
+                "Download API transformed table for comparison",
+                data=api_file_bytes,
+                file_name=api_file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
         else:
             uploaded_files = []
     else:
@@ -1034,7 +1100,16 @@ cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
 recent_label = ", ".join(str(d) for d in recent_dates) if recent_dates else "no report dates found"
-st.info(f"Recent problem table is based on the latest {int(recent_days)} report day(s): {recent_label}.")
+if source_option == "API":
+    st.info(
+        f"API display note: API mode uses the fixed latest 5-calendar-day fetch window. "
+        f"The recent/problem tab shows the report dates actually returned inside that API window: {recent_label}."
+    )
+else:
+    st.info(
+        f"Display note: the source data was loaded above. The recent problem table/tab only filters the validation results "
+        f"to the latest {int(recent_days)} report date(s) found in that uploaded source: {recent_label}."
+    )
 
 # Extra KPI summary frames for charts/export.
 by_severity = errors.groupby("severity", dropna=False).size().reset_index(name="count") if not errors.empty else pd.DataFrame(columns=["severity", "count"])
@@ -1045,9 +1120,11 @@ status_summary = pd.DataFrame(
     ]
 )
 
+recent_tab_label = "API returned days" if source_option == "API" else f"Last {int(recent_days)} days"
+
 main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs([
     "All errors",
-    f"Last {int(recent_days)} days",
+    recent_tab_label,
     "KPI dashboard",
     "Checked rows",
     "Export / setup",
@@ -1074,7 +1151,12 @@ with main_tab:
         st.dataframe(by_rule.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
 with recent_tab:
-    display_error_table(f"Problems in the latest {int(recent_days)} report day(s)", recent_errors)
+    recent_table_title = (
+        "Problems in the API returned report date(s)"
+        if source_option == "API"
+        else f"Problems in the latest {int(recent_days)} report day(s)"
+    )
+    display_error_table(recent_table_title, recent_errors)
 
     available_dates = sorted([d for d in errors_dated.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_dated.empty else []
     if available_dates:
@@ -1159,10 +1241,20 @@ with export_tab:
     )
 
     recent_csv_bytes = recent_errors.to_csv(index=False).encode("utf-8-sig")
+    recent_export_label = (
+        "Download API-window errors as CSV"
+        if source_option == "API"
+        else f"Download last {int(recent_days)} days errors as CSV"
+    )
+    recent_export_file_name = (
+        "noon_report_errors_api_window.csv"
+        if source_option == "API"
+        else f"noon_report_errors_last_{int(recent_days)}_days.csv"
+    )
     st.download_button(
-        f"Download last {int(recent_days)} days errors as CSV",
+        recent_export_label,
         data=recent_csv_bytes,
-        file_name=f"noon_report_errors_last_{int(recent_days)}_days.csv",
+        file_name=recent_export_file_name,
         mime="text/csv",
         use_container_width=True,
     )
