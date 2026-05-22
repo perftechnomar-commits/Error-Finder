@@ -378,11 +378,10 @@ with st.sidebar:
 
 
 # -----------------------------------------------------------------------------
-# Data source
+# 
 # -----------------------------------------------------------------------------
 
 source_mode = st.radio(
-    "Data source",
     ["Department auto source", "Manual upload"],
     index=0,
     horizontal=True,
