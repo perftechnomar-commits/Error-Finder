@@ -386,6 +386,7 @@ source_mode = st.radio(
     ["Department auto source", "Manual upload"],
     index=0,
     horizontal=True,
+    label_visibility="collapsed",
 )
 
 uploaded_files = []
