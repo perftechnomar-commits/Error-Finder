@@ -672,12 +672,47 @@ with main_tab:
 with recent_tab:
     display_error_table("Problems in selected data window", recent_errors_scope)
 
-    available_dates = sorted([d for d in errors_scope.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_scope.empty else []
+    # Report-day drilldown. Use checked rows first so dates with zero errors can still be selected.
+    if not checked_rows_scope.empty and "report_date" in checked_rows_scope.columns:
+        available_dates = sorted([d for d in checked_rows_scope["report_date"].dropna().unique().tolist()])
+    elif not errors_scope.empty and "report_date" in errors_scope.columns:
+        available_dates = sorted([d for d in errors_scope["report_date"].dropna().unique().tolist()])
+    else:
+        available_dates = []
+
     if available_dates:
         st.divider()
-        selected_date = st.selectbox("Show problems for one specific report day", options=available_dates, index=len(available_dates) - 1)
-        day_errors = errors_scope[errors_scope["report_date"].eq(selected_date)].copy()
-        display_error_table(f"Problems for {selected_date}", day_errors)
+
+        single_col, multi_col = st.columns(2)
+
+        with single_col:
+            selected_date = st.selectbox(
+                "Show problems for one specific report day",
+                options=available_dates,
+                index=len(available_dates) - 1,
+                format_func=format_report_date,
+            )
+
+        with multi_col:
+            default_multi_dates = available_dates[-2:] if len(available_dates) >= 2 else available_dates
+            selected_dates = st.multiselect(
+                "Show problems for multiple report days",
+                options=available_dates,
+                default=default_multi_dates,
+                format_func=format_report_date,
+                help="Select one or more report dates from the current vessel/source window.",
+            )
+
+        day_errors = errors_scope[errors_scope["report_date"].eq(selected_date)].copy() if not errors_scope.empty else errors_scope.copy()
+        display_error_table(f"Problems for {format_report_date(selected_date)}", day_errors)
+
+        if selected_dates:
+            multi_errors = errors_scope[errors_scope["report_date"].isin(selected_dates)].copy() if not errors_scope.empty else errors_scope.copy()
+            selected_dates_label = ", ".join(format_report_date(d) for d in selected_dates)
+            display_error_table("Problems for selected report days", multi_errors)
+            st.caption(f"Selected report days: {selected_dates_label}")
+        else:
+            st.info("Select one or more report days to see a combined problem table.")
 
 with kpi_tab:
     st.subheader("KPI dashboard")
