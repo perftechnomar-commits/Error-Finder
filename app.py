@@ -448,7 +448,7 @@ with st.expander("Validation rules included", expanded=False):
 
 
 # -----------------------------------------------------------------------------
-# Validation execution: run once, then dashboard filters are smooth
+# Validation execution
 # -----------------------------------------------------------------------------
 
 current_source_signature = build_source_signature(uploaded_files)
@@ -463,12 +463,17 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-run = st.button("Run validation", type="primary", use_container_width=True)
 
-if run:
+def run_validation_and_store(progress_text: str) -> None:
+    """Run full validation and store the raw result.
+
+    Rule selection is applied later as a dashboard filter, without rerunning validation.
+    Validation thresholds are calculation parameters, so threshold changes trigger
+    immediate revalidation after the first run.
+    """
     all_results = []
     failed = []
-    progress = st.progress(0, text="Starting validation...")
+    progress = st.progress(0, text=progress_text)
 
     for pos, uploaded in enumerate(uploaded_files, start=1):
         try:
@@ -482,8 +487,6 @@ if run:
     progress.empty()
 
     if all_results:
-        # Store the full validation result.
-        # Rule selection is applied later as a dashboard filter, without rerunning validation.
         st.session_state["validation_combined"] = combine_results(all_results)
         st.session_state["validation_source_signature"] = current_source_signature
         st.session_state["validation_config_signature"] = current_config_signature
@@ -492,16 +495,28 @@ if run:
 
     st.session_state["validation_failed"] = failed
 
+
+run = st.button("Run validation", type="primary", use_container_width=True)
+
+source_changed_after_run = (
+    st.session_state["validation_combined"] is not None
+    and st.session_state["validation_source_signature"] != current_source_signature
+)
+thresholds_changed_after_run = (
+    st.session_state["validation_combined"] is not None
+    and st.session_state["validation_config_signature"] != current_config_signature
+)
+
+if run:
+    run_validation_and_store("Starting validation...")
+elif source_changed_after_run:
+    run_validation_and_store("Source file changed. Revalidating automatically...")
+elif thresholds_changed_after_run:
+    run_validation_and_store("Validation thresholds changed. Revalidating automatically...")
+
 if st.session_state["validation_combined"] is None:
-    st.info("Run validation once. After that, vessel/day/rule/report filters work without rerunning validation.")
+    st.info("Run validation once. After that, vessel/day/rule/report filters work without rerunning validation. Threshold changes will revalidate automatically.")
     st.stop()
-
-if st.session_state["validation_source_signature"] != current_source_signature:
-    st.warning("The uploaded source file changed. Click Run validation to apply the new file.")
-    st.stop()
-
-if st.session_state["validation_config_signature"] != current_config_signature:
-    st.info("Validation thresholds changed. Current results still use the previous thresholds. Click Run validation to apply them.")
 
 failed = st.session_state["validation_failed"]
 if failed:
