@@ -69,6 +69,34 @@ def filter_to_report_dates(df: pd.DataFrame, report_dates: list) -> pd.DataFrame
     return df[df["report_date"].isin(report_dates)].copy()
 
 
+def format_report_date(value: object) -> str:
+    """Format report dates as d/m/yy for compact dashboard captions."""
+    if value is None or pd.isna(value):
+        return ""
+    dt = pd.to_datetime(value)
+    return f"{dt.day}/{dt.month}/{dt.strftime('%y')}"
+
+
+def get_data_window_caption(rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> str:
+    """Build a small caption showing the report-date window available in the loaded source."""
+    date_values = []
+    for df in (rows_df, errors_df):
+        if not df.empty and "report_date" in df.columns:
+            date_values.extend(df["report_date"].dropna().tolist())
+
+    if not date_values:
+        return "Report days: no report dates found"
+
+    dates = sorted(set(date_values))
+    start_date = dates[0]
+    end_date = dates[-1]
+
+    if start_date == end_date:
+        return f"Report days: {format_report_date(start_date)}"
+
+    return f"Report days from {format_report_date(start_date)} - {format_report_date(end_date)}"
+
+
 def build_daily_kpis(checked_rows: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
     """Build daily operational validation KPIs."""
     if checked_rows.empty or "start_gmt" not in checked_rows.columns:
@@ -332,15 +360,6 @@ with st.sidebar:
     st.header("Validation thresholds")
 
     config = DEFAULT_CONFIG.copy()
-    recent_days = st.number_input(
-        "Dashboard report days to show",
-        min_value=1,
-        max_value=5,
-        value=5,
-        step=1,
-        help="Display filter only. It scopes the dashboard to the latest N report dates from the loaded file and does not rerun validation.",
-    )
-
     with st.expander("Rule filter", expanded=True):
         rule_options = get_rule_options()
         default_rules = [rule for rule in rule_options if "sludge" not in rule.lower()]
@@ -500,15 +519,12 @@ skipped_rules = combined["skipped_rules"]
 errors_dated_all = with_report_dates(errors) if not errors.empty else errors.copy()
 checked_rows_dated_all = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
 
-# Dashboard report-day scope. This is a display filter only; it does not rerun validation.
-# Dates are taken from checked rows first, so dates with zero errors are still respected.
-recent_dates = get_latest_report_dates(checked_rows_dated_all, int(recent_days))
-if not recent_dates:
-    recent_dates = get_latest_report_dates(errors_dated_all, int(recent_days))
-
-errors_dated = filter_to_report_dates(errors_dated_all, recent_dates)
-checked_rows_dated = filter_to_report_dates(checked_rows_dated_all, recent_dates)
+# Use the full loaded source window.
+# The source file itself controls the time span; dashboard filters should not silently cut it down.
+errors_dated = errors_dated_all.copy()
+checked_rows_dated = checked_rows_dated_all.copy()
 recent_errors = errors_dated.copy()
+data_window_caption = get_data_window_caption(checked_rows_dated, errors_dated)
 
 
 # -----------------------------------------------------------------------------
@@ -602,12 +618,14 @@ cols[3].metric("Rows OK", rows_ok)
 cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
+st.caption(data_window_caption)
+
 # -----------------------------------------------------------------------------
 # Tabs
 # -----------------------------------------------------------------------------
 
 fleet_tab, main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs(
-    ["Fleet overview", "All errors", f"Latest {int(recent_days)} report days", "KPI dashboard", "Checked rows", "Export / setup"]
+    ["Fleet overview", "All errors", "Report days", "KPI dashboard", "Checked rows", "Export / setup"]
 )
 
 with fleet_tab:
@@ -652,7 +670,7 @@ with main_tab:
         st.dataframe(by_rule_scope.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
 
 with recent_tab:
-    display_error_table(f"Problems in selected latest {int(recent_days)} report day(s)", recent_errors_scope)
+    display_error_table("Problems in selected data window", recent_errors_scope)
 
     available_dates = sorted([d for d in errors_scope.get("report_date", pd.Series(dtype=object)).dropna().unique().tolist()]) if not errors_scope.empty else []
     if available_dates:
@@ -725,9 +743,9 @@ with export_tab:
     )
 
     st.download_button(
-        f"Download selected latest {int(recent_days)} report day errors as CSV",
+        "Download selected data-window errors as CSV",
         data=recent_errors_scope.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"noon_report_errors_last_{int(recent_days)}_days.csv",
+        file_name="noon_report_errors_selected_data_window.csv",
         mime="text/csv",
         use_container_width=True,
     )
