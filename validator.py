@@ -82,7 +82,6 @@ RULES: List[Dict[str, str]] = [
     {"rule_id": "R06", "issue_type": "MCR/ME Load", "severity": "Medium", "description": "Sea rows where ME Load [%MCR] is outside the accepted band."},
     {"rule_id": "R07", "issue_type": "Electric Load", "severity": "Medium", "description": "Total DG Power [kW] is outside the accepted range."},
     {"rule_id": "R10", "issue_type": "DG Hours", "severity": "High", "description": "Any DG running hours exceed Time Since Last Report."},
-    {"rule_id": "R25", "issue_type": "Multiple DGs", "severity": "Medium", "description": "More than one DG appears to be running while total electric load is too low for the additional DG capacity."},
     {"rule_id": "R11", "issue_type": "SFOC", "severity": "Medium", "description": "Sea rows with non-zero SFOC outside the accepted range."},
     {"rule_id": "R12", "issue_type": "Torque", "severity": "Medium", "description": "Sea rows with torque-meter power outside the accepted range."},
     {"rule_id": "R13", "issue_type": "Low FW Production", "severity": "Medium", "description": "Sea rows with low FW production during long steaming."},
@@ -97,6 +96,7 @@ RULES: List[Dict[str, str]] = [
     {"rule_id": "R24A", "issue_type": "DG Cons >13", "severity": "Medium", "description": "DG consumption exceeds fixed high threshold."},
     {"rule_id": "R24B", "issue_type": "High DG Cons vs Load", "severity": "Medium", "description": "DG consumption is high compared with electric load."},
     {"rule_id": "R24C", "issue_type": "DG Cons <1", "severity": "Medium", "description": "Sea rows with DG consumption below minimum threshold."},
+    {"rule_id": "R25", "issue_type": "Multiple DGs", "severity": "Medium", "description": "Multiple DGs running while total electric load is too low to justify extra generator usage."},
 ]
 
 
@@ -417,49 +417,41 @@ def validate_noon_report(
             add(i, "R07", f"Electric Load = {fmt_num(total_dg_power.iloc[i], 0)}", total_dg_power.iloc[i], f"{cfg['electric_load_min_kw']} to {cfg['electric_load_max_kw']} kW", ["total_dg_power"])
 
         # R10 DG Hours
-        dg_hours_over_time = False
         if pd.notna(time_since_last.iloc[i]):
             over = []
             for key, series in dg_hours.items():
                 if pd.notna(series.iloc[i]) and series.iloc[i] > time_since_last.iloc[i]:
                     over.append(mapping.get(key) or key)
             if over:
-                dg_hours_over_time = True
                 add(i, "R10", "a DG's Hours is more then Time since last reporting", "; ".join(over), f"Each DG running hours <= {time_since_last.iloc[i]}", ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"])
 
-        # R25 Multiple DGs without sufficient load
-        if (
-            pd.notna(time_since_last.iloc[i])
-            and time_since_last.iloc[i] > 0
-            and pd.notna(total_dg_power.iloc[i])
-            and not dg_hours_over_time
-        ):
-            dg_hour_values = [
-                float(series.iloc[i])
-                for series in dg_hours.values()
-                if pd.notna(series.iloc[i])
-            ]
-            dg_hours_total = sum(dg_hour_values)
-
-            # Same logic as the legacy checker:
-            # total DG running hours / time since last report.
-            # A value > 1 means more than one DG was effectively running.
-            dg_equivalent_count = dg_hours_total / (time_since_last.iloc[i] + 0.001)
-
-            if dg_equivalent_count > 1:
-                single_dg_kw = float(cfg["single_dg_max_kw"])
-                load_factor = float(cfg["multiple_dg_load_factor"])
-                minimum_expected_load = load_factor * (dg_equivalent_count - 1) * single_dg_kw
-
-                if total_dg_power.iloc[i] < minimum_expected_load:
-                    add(
-                        i,
-                        "R25",
-                        f"Multiple DGs in use, vessel single DG kW = {fmt_num(single_dg_kw, 0)}",
-                        f"DG equivalent count = {fmt_num(dg_equivalent_count, 2)}, Electric Load = {fmt_num(total_dg_power.iloc[i], 0)} kW",
-                        f">= {fmt_num(minimum_expected_load, 0)} kW based on {fmt_num(load_factor * 100, 0)}% of extra DG capacity",
-                        ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
-                    )
+            # R25 Multiple DGs
+            # Legacy checker logic:
+            # counter = sum(DG running hours) / (Time Since Last Report + 0.001)
+            # if counter > 1, more than one DG was effectively running.
+            # It is suspicious when total electric load is lower than:
+            # 70% * (counter - 1) * vessel single-DG max kW.
+            if pd.notna(time_since_last.iloc[i]) and time_since_last.iloc[i] > 0 and pd.notna(total_dg_power.iloc[i]):
+                valid_dg_hours = [
+                    series.iloc[i]
+                    for series in dg_hours.values()
+                    if pd.notna(series.iloc[i])
+                ]
+                dg_hours_sum = sum(valid_dg_hours) if valid_dg_hours else np.nan
+                if pd.notna(dg_hours_sum):
+                    dg_running_ratio = dg_hours_sum / (time_since_last.iloc[i] + 0.001)
+                    single_dg_kw = float(cfg.get("single_dg_max_kw", 2900.0))
+                    load_factor = float(cfg.get("multiple_dg_load_factor", 0.70))
+                    expected_min_load = load_factor * (dg_running_ratio - 1) * single_dg_kw
+                    if dg_running_ratio > 1 and total_dg_power.iloc[i] < expected_min_load:
+                        add(
+                            i,
+                            "R25",
+                            f"Multiple DGs in use, vessel single DG kW = {fmt_num(single_dg_kw, 0)}",
+                            total_dg_power.iloc[i],
+                            f">= {fmt_num(expected_min_load, 0)} kW based on DG running ratio {fmt_num(dg_running_ratio, 2)}",
+                            ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
+                        )
 
         # R18 Low MGO ROB
         if pd.notna(rob_mgo.iloc[i]) and rob_mgo.iloc[i] < cfg["mgo_rob_min_mt"]:
@@ -524,7 +516,6 @@ def validate_noon_report(
         "R06": ["report_type", "state_name", "me_load"],
         "R07": ["total_dg_power"],
         "R10": ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"],
-        "R25": ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
         "R11": ["report_type", "state_name", "sfoc"],
         "R12": ["report_type", "state_name", "torque_power"],
         "R13": ["report_type", "state_name", "fw_produced", "steaming_time"],
@@ -539,6 +530,7 @@ def validate_noon_report(
         "R24A": ["dg_cons_24h"],
         "R24B": ["dg_cons_24h", "total_dg_power"],
         "R24C": ["report_type", "state_name", "dg_cons_24h"],
+        "R25": ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
     }
     for rule in RULES:
         missing_cols = [k for k in required_by_rule.get(rule["rule_id"], []) if mapping.get(k) is None]
