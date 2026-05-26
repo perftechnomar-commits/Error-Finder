@@ -238,9 +238,6 @@ def build_issue_lines(errors_df: pd.DataFrame) -> str:
             parts.append(clean_message_value(row.get("ship_name")))
         if "report_type" in view.columns:
             parts.append(clean_message_value(row.get("report_type")))
-        if "excel_row" in view.columns:
-            parts.append(f"Excel row {clean_message_value(row.get('excel_row'))}")
-
         issue = clean_message_value(row.get("issue_type"))
         message = clean_message_value(row.get("message"), "")
         value = clean_message_value(row.get("value"), "")
@@ -472,10 +469,7 @@ def build_issue_selector_options(errors_df: pd.DataFrame, selected_vessel_name: 
         date_text = format_template_report_date(row.get("report_date")) if "report_date" in view.columns else "-"
         vessel = clean_message_value(row.get("ship_name"), selected_vessel_name or "-")
         issue = clean_message_value(row.get("issue_type"), "Validation issue")
-        excel_row = clean_message_value(row.get("excel_row"), "-")
         label_parts = [f"#{idx + 1}", vessel, date_text, issue]
-        if excel_row != "-":
-            label_parts.append(f"Excel row {excel_row}")
         options.append((" | ".join(part for part in label_parts if part and part != "-"), idx))
     return options
 
@@ -514,7 +508,6 @@ def build_issue_detail_block(issue_row: pd.Series | dict, issue_no: int | None =
         ("Vessel", "ship_name"),
         ("Report type", "report_type"),
         ("Report ID", "report_id"),
-        ("Excel row", "excel_row"),
     ]:
         value = clean_message_value(get_value(key), "")
         if value:
@@ -545,7 +538,7 @@ def build_captain_chief_engineer_message(errors_df: pd.DataFrame, selected_vesse
         )
 
     view = errors_df.copy().reset_index(drop=True)
-    sort_cols = [c for c in ["report_date", "ship_name", "report_type", "excel_row", "issue_type"] if c in view.columns]
+    sort_cols = [c for c in ["report_date", "ship_name", "report_type", "issue_type"] if c in view.columns]
     if sort_cols:
         ascending = [False if c == "report_date" else True for c in sort_cols]
         view = view.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
