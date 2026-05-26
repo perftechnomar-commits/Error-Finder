@@ -23,7 +23,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "sfoc_min": 160.0,
     "sfoc_max": 280.0,
     "torque_power_min_kw": 3400.0,
-    "torque_power_max_kw": 40000.0,
+    "torque_power_max_kw": 25000.0,
     "fw_produced_min_cbm": 10.0,
     "fw_consumed_max_cbm": 10.0,
     "sludge_factor_of_total_consumption": 0.015,
@@ -37,7 +37,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dg_cons_high_mt": 13.0,
     "dg_cons_low_mt": 1.0,
     "dg_sfc_g_per_kwh": 220.0,
-    "dg_cons_vs_load_buffer_mt": 2.0
+    "dg_cons_vs_load_buffer_mt": 2.0,
+    "single_dg_max_kw": 2900.0,
+    "multiple_dg_load_factor": 0.70,
 }
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
@@ -81,7 +83,7 @@ RULES: List[Dict[str, str]] = [
     {"rule_id": "R07", "issue_type": "Electric Load", "severity": "Medium", "description": "Total DG Power [kW] is outside the accepted range."},
     {"rule_id": "R10", "issue_type": "DG Hours", "severity": "High", "description": "Any DG running hours exceed Time Since Last Report."},
     {"rule_id": "R11", "issue_type": "SFOC", "severity": "Medium", "description": "Sea rows with non-zero SFOC outside the accepted range."},
-    {"rule_id": "R12", "issue_type": "Power from Torque Meter", "severity": "Medium", "description": "Sea rows with torque-meter power outside the accepted range."},
+    {"rule_id": "R12", "issue_type": "Torque", "severity": "Medium", "description": "Sea rows with torque-meter power outside the accepted range."},
     {"rule_id": "R13", "issue_type": "Low FW Production", "severity": "Medium", "description": "Sea rows with low FW production during long steaming."},
     {"rule_id": "R14", "issue_type": "High FW Consumption", "severity": "Medium", "description": "Sea rows with high FW consumption."},
     {"rule_id": "R15", "issue_type": "Sludge Incinerated", "severity": "Low", "description": "Sea rows where sludge incinerated/evaporated is zero or blank."},
