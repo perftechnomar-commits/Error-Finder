@@ -11,7 +11,7 @@ import streamlit as st
 
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21"
+APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_FIX_MERGE_TEMPLATE"
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -673,8 +673,29 @@ def rules_by_keywords(rule_options: list[str], keywords: list[str]) -> list[str]
     return out
 
 
+def normalize_merge_key_value(value: object) -> str:
+    """Normalize merge-key values so app filtering is stable across mixed Excel dtypes."""
+    try:
+        if pd.isna(value):
+            return "__MISSING__"
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value).strip()
+
+
 def rebuild_checked_rows_issue_counts(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
-    """Recalculate issue_count after validation rule scope is applied."""
+    """Recalculate issue_count after validation rule scope is applied.
+
+    The checked rows and errors tables can contain the same key with different
+    pandas dtypes, depending on how Excel interpreted the source values.
+    For example, report_id or excel_row may be numeric in one table and object
+    in another. Normalize temporary merge keys to strings before merging to
+    avoid pandas dtype mismatch errors.
+    """
     out = checked_rows_df.copy()
     if out.empty:
         return out
@@ -687,10 +708,18 @@ def rebuild_checked_rows_issue_counts(checked_rows_df: pd.DataFrame, errors_df: 
         out["issue_count"] = 0
         return out
 
-    issue_counts = errors_df.groupby(keys, dropna=False).size().reset_index(name="display_issue_count")
-    out = out.merge(issue_counts, on=keys, how="left")
+    errors_for_count = errors_df.copy()
+    merge_keys = []
+    for key in keys:
+        merge_key = f"__merge_key_{key}"
+        out[merge_key] = out[key].map(normalize_merge_key_value)
+        errors_for_count[merge_key] = errors_for_count[key].map(normalize_merge_key_value)
+        merge_keys.append(merge_key)
+
+    issue_counts = errors_for_count.groupby(merge_keys, dropna=False).size().reset_index(name="display_issue_count")
+    out = out.merge(issue_counts, on=merge_keys, how="left")
     out["issue_count"] = out["display_issue_count"].fillna(0).astype(int)
-    return out.drop(columns=["display_issue_count"])
+    return out.drop(columns=["display_issue_count", *merge_keys])
 
 
 def build_portfolio_summary(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
