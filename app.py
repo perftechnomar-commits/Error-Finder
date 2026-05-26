@@ -219,8 +219,8 @@ def get_template_date_label(errors_df: pd.DataFrame, checked_rows_df: pd.DataFra
     return f"{format_template_report_date(unique_dates[0])} - {format_template_report_date(unique_dates[-1])}"
 
 
-def build_issue_lines(errors_df: pd.DataFrame, max_items: int = 12) -> str:
-    """Create bullet lines for the most relevant validation findings."""
+def build_issue_lines(errors_df: pd.DataFrame) -> str:
+    """Create bullet lines for all validation findings in the current filtered scope."""
     if errors_df.empty:
         return "- No validation errors found for this selection."
 
@@ -231,7 +231,7 @@ def build_issue_lines(errors_df: pd.DataFrame, max_items: int = 12) -> str:
         view = view.sort_values(sort_cols, ascending=ascending)
 
     lines = []
-    for _, row in view.head(int(max_items)).iterrows():
+    for _, row in view.iterrows():
         parts = []
         if "report_date" in view.columns:
             parts.append(format_template_report_date(row.get("report_date")))
@@ -260,9 +260,6 @@ def build_issue_lines(errors_df: pd.DataFrame, max_items: int = 12) -> str:
         prefix = " | ".join(p for p in parts if p and p != "-")
         lines.append(f"- {prefix} | {detail}" if prefix else f"- {detail}")
 
-    remaining = len(view) - len(lines)
-    if remaining > 0:
-        lines.append(f"- ... plus {remaining} more issue(s) in the exported Excel report.")
     return "\n".join(lines)
 
 
@@ -296,7 +293,7 @@ def build_message_template(
     vessel_summary_df: pd.DataFrame,
     selected_vessel_name: str,
     data_window_text: str,
-    max_items: int = 12,
+
 ) -> str:
     """Generate a copy-ready operational message from the current app selection."""
     vessel_label = selected_vessel_name if selected_vessel_name != "All vessels" else "fleet / current selection"
@@ -305,7 +302,7 @@ def build_message_template(
     rows_with_issues = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) > 0).sum()) if total_rows else 0
     total_issues = len(errors_df)
     high_issues = int(errors_df["severity"].astype(str).eq("High").sum()) if not errors_df.empty and "severity" in errors_df.columns else 0
-    issue_lines = build_issue_lines(errors_df, max_items=max_items)
+    issue_lines = build_issue_lines(errors_df)
     rule_lines = build_rule_summary_lines(by_rule_df)
     vessel_lines = build_vessel_attention_lines(vessel_summary_df)
 
@@ -379,7 +376,7 @@ def build_message_templates_df(
     vessel_summary_df: pd.DataFrame,
     selected_vessel_name: str,
     data_window_text: str,
-    max_items: int = 12,
+
 ) -> pd.DataFrame:
     """Return all standard templates as a dataframe, ready for optional Excel export."""
     template_names = ["Vessel follow-up email", "Internal fleet summary", "Short Teams/WhatsApp message"]
@@ -397,11 +394,189 @@ def build_message_templates_df(
                     vessel_summary_df,
                     selected_vessel_name,
                     data_window_text,
-                    max_items=max_items,
                 ),
             }
         )
     return pd.DataFrame(rows)
+
+
+
+def build_issue_follow_up_message(issue_row: pd.Series | dict) -> str:
+    """Build one copy-paste message for one validation issue row."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    return (
+        "Dear Captain / Chief Engineer,\n\n"
+        "Please note that a validation check has identified a possible inconsistency in the submitted report.\n\n"
+        f"Issue: {clean_message_value(get_value('issue_type'))}\n"
+        f"Reported value: {clean_message_value(get_value('value'))}\n"
+        f"Expected / normal range: {clean_message_value(get_value('expected'))}\n"
+        f"Related field(s): {clean_message_value(get_value('columns'))}\n\n"
+        "Kindly verify the reported value and amend the report if required. "
+        "If the value is confirmed correct, please provide a short comment/justification in the remarks.\n\n"
+        "Best Regards,"
+    )
+
+
+def build_issue_message_subject(issue_row: pd.Series | dict, selected_vessel_name: str = "") -> str:
+    """Build a concise email subject for the selected validation issue."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    vessel = clean_message_value(get_value("ship_name"), selected_vessel_name or "Vessel")
+    issue = clean_message_value(get_value("issue_type"), "Validation issue")
+    report_date = format_template_report_date(get_value("report_date"))
+    date_suffix = f" - {report_date}" if report_date and report_date != "-" else ""
+    return f"Noon report validation check - {vessel}{date_suffix} - {issue}"
+
+
+def add_copy_paste_issue_messages(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Add one copy-paste message column per validation issue for Excel/CSV export."""
+    out = errors_df.copy()
+    if out.empty:
+        out["email_subject"] = pd.Series(dtype="object")
+        out["copy_paste_message"] = pd.Series(dtype="object")
+        return out
+    out["email_subject"] = out.apply(lambda row: build_issue_message_subject(row, selected_vessel_name), axis=1)
+    out["copy_paste_message"] = out.apply(build_issue_follow_up_message, axis=1)
+    return out
+
+
+def build_issue_messages_df(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Return a dedicated dataframe containing one generated message per validation issue."""
+    if errors_df.empty:
+        return pd.DataFrame(columns=["message_no", "ship_name", "report_date", "issue_type", "email_subject", "copy_paste_message"])
+    export_df = add_copy_paste_issue_messages(errors_df, selected_vessel_name).reset_index(drop=True)
+    export_df.insert(0, "message_no", range(1, len(export_df) + 1))
+    preferred = [
+        "message_no",
+        "ship_name",
+        "report_date",
+        "report_type",
+        "excel_row",
+        "report_id",
+        "issue_type",
+        "severity",
+        "value",
+        "expected",
+        "columns",
+        "email_subject",
+        "copy_paste_message",
+    ]
+    return export_df[[col for col in preferred if col in export_df.columns]]
+
+
+def build_issue_selector_options(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> list[tuple[str, int]]:
+    """Build readable selectbox labels for validation issues."""
+    if errors_df.empty:
+        return []
+    view = errors_df.reset_index(drop=True)
+    options = []
+    for idx, row in view.iterrows():
+        date_text = format_template_report_date(row.get("report_date")) if "report_date" in view.columns else "-"
+        vessel = clean_message_value(row.get("ship_name"), selected_vessel_name or "-")
+        issue = clean_message_value(row.get("issue_type"), "Validation issue")
+        excel_row = clean_message_value(row.get("excel_row"), "-")
+        label_parts = [f"#{idx + 1}", vessel, date_text, issue]
+        if excel_row != "-":
+            label_parts.append(f"Excel row {excel_row}")
+        options.append((" | ".join(part for part in label_parts if part and part != "-"), idx))
+    return options
+
+
+def build_all_issue_messages_text(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build a combined text containing one message for every issue in the current filtered scope."""
+    if errors_df.empty:
+        return "No validation issues were found for the current selection."
+    view = errors_df.reset_index(drop=True)
+    messages = []
+    for idx, row in view.iterrows():
+        subject = build_issue_message_subject(row, selected_vessel_name)
+        messages.append(f"MESSAGE {idx + 1}\nSubject: {subject}\n\n{build_issue_follow_up_message(row)}")
+    return "\n\n---\n\n".join(messages)
+
+
+def build_captain_chief_engineer_subject(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build one email subject for the current filtered validation scope."""
+    vessel_label = selected_vessel_name if selected_vessel_name and selected_vessel_name != "All vessels" else "Current selection"
+    date_label = get_template_date_label(errors_df, pd.DataFrame())
+    date_suffix = f" - {date_label}" if date_label and date_label != "selected report window" else ""
+    return f"Noon report validation check - {vessel_label}{date_suffix}"
+
+
+def build_issue_detail_block(issue_row: pd.Series | dict, issue_no: int | None = None) -> str:
+    """Build one issue block inside the Captain / Chief Engineer message."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    title = f"Issue {issue_no}" if issue_no is not None else "Issue"
+
+    context_lines = []
+    report_date = format_template_report_date(get_value("report_date"))
+    if report_date and report_date != "-":
+        context_lines.append(f"Report date: {report_date}")
+
+    for label, key in [
+        ("Vessel", "ship_name"),
+        ("Report type", "report_type"),
+        ("Report ID", "report_id"),
+        ("Excel row", "excel_row"),
+    ]:
+        value = clean_message_value(get_value(key), "")
+        if value:
+            context_lines.append(f"{label}: {value}")
+
+    lines = [f"{title}:"]
+    if context_lines:
+        lines.extend(context_lines)
+    lines.extend(
+        [
+            f"Issue: {clean_message_value(get_value('issue_type'))}",
+            f"Reported value: {clean_message_value(get_value('value'))}",
+            f"Expected / normal range: {clean_message_value(get_value('expected'))}",
+            f"Related field(s): {clean_message_value(get_value('columns'))}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_captain_chief_engineer_message(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build the single copy-paste message for Captain / Chief Engineer using current filters."""
+    if errors_df.empty:
+        return (
+            "Dear Captain / Chief Engineer,\n\n"
+            "Please note that the validation check has been completed for the current selection.\n\n"
+            "No possible inconsistencies were identified in the submitted report(s).\n\n"
+            "Best Regards,"
+        )
+
+    view = errors_df.copy().reset_index(drop=True)
+    sort_cols = [c for c in ["report_date", "ship_name", "report_type", "excel_row", "issue_type"] if c in view.columns]
+    if sort_cols:
+        ascending = [False if c == "report_date" else True for c in sort_cols]
+        view = view.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    issue_blocks = [build_issue_detail_block(row, idx + 1) for idx, row in view.iterrows()]
+    inconsistency_word = "a possible inconsistency" if len(view) == 1 else "possible inconsistencies"
+
+    return (
+        "Dear Captain / Chief Engineer,\n\n"
+        f"Please note that a validation check has identified {inconsistency_word} in the submitted report.\n\n"
+        + "\n\n".join(issue_blocks)
+        + "\n\n"
+        "Kindly verify the reported value(s) and amend the report if required. "
+        "If the value(s) are confirmed correct, please provide a short comment/justification in the remarks.\n\n"
+        "Best Regards,"
+    )
+
+
+def build_captain_message_df(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Return one-row dataframe containing the current Captain / Chief Engineer message."""
+    return pd.DataFrame(
+        [
+            {
+                "email_subject": build_captain_chief_engineer_subject(errors_df, selected_vessel_name),
+                "copy_paste_message": build_captain_chief_engineer_message(errors_df, selected_vessel_name),
+                "issue_count": len(errors_df),
+                "vessel_scope": selected_vessel_name,
+            }
+        ]
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -996,24 +1171,23 @@ with rows_tab:
 
 with export_tab:
     st.subheader("Export results")
+
+    errors_export_scope = add_copy_paste_issue_messages(errors_scope, selected_vessel)
+    recent_errors_export_scope = add_copy_paste_issue_messages(recent_errors_scope, selected_vessel)
+    captain_message_subject = build_captain_chief_engineer_subject(errors_scope, selected_vessel)
+    captain_message_text = build_captain_chief_engineer_message(errors_scope, selected_vessel)
+    captain_message_export = build_captain_message_df(errors_scope, selected_vessel)
+
     combined_for_export = dict(combined)
-    combined_for_export["errors"] = errors_scope
+    combined_for_export["errors"] = errors_export_scope
     combined_for_export["checked_rows"] = checked_rows_scope
     combined_for_export["by_rule"] = by_rule_scope
     combined_for_export["portfolio_summary"] = build_portfolio_summary(checked_rows_scope, errors_scope)
-    combined_for_export["recent_errors"] = recent_errors_scope
+    combined_for_export["recent_errors"] = recent_errors_export_scope
     combined_for_export["daily_kpis"] = daily_kpis_scope
     combined_for_export["by_severity"] = by_severity_scope
     combined_for_export["status_summary"] = status_summary_scope
-    combined_for_export["message_templates"] = build_message_templates_df(
-        errors_scope,
-        checked_rows_scope,
-        by_rule_scope,
-        vessel_summary,
-        selected_vessel,
-        data_window_caption,
-        max_items=12,
-    )
+    combined_for_export["captain_message"] = captain_message_export
 
     excel_bytes = results_to_excel_bytes(combined_for_export)
     st.download_button(
@@ -1026,7 +1200,7 @@ with export_tab:
 
     st.download_button(
         "Download current selection errors as CSV",
-        data=errors_scope.to_csv(index=False).encode("utf-8-sig"),
+        data=errors_export_scope.to_csv(index=False).encode("utf-8-sig"),
         file_name="noon_report_errors_current_selection.csv",
         mime="text/csv",
         use_container_width=True,
@@ -1034,61 +1208,30 @@ with export_tab:
 
     st.download_button(
         "Download selected data-window errors as CSV",
-        data=recent_errors_scope.to_csv(index=False).encode("utf-8-sig"),
+        data=recent_errors_export_scope.to_csv(index=False).encode("utf-8-sig"),
         file_name="noon_report_errors_selected_data_window.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
     st.divider()
-    st.subheader("Copy-paste message templates")
+    st.subheader("Copy-paste message to Captain / Chief Engineer")
     st.caption(
-        "Templates are generated from the same vessel/rule/report-day selection used by the export buttons above. "
-        "Use the text box to copy the message into email, Teams, WhatsApp, or another system."
+        "This message uses the current vessel/rule/date filters already applied in the dashboard. "
+        "Adjust the filters if the message contains too many issues."
     )
 
-    template_col, scope_col, limit_col = st.columns([2, 1.3, 1])
-    with template_col:
-        selected_template_name = st.selectbox(
-            "Template type",
-            ["Vessel follow-up email", "Internal fleet summary", "Short Teams/WhatsApp message"],
-        )
-    with scope_col:
-        template_data_scope = st.selectbox(
-            "Template data scope",
-            ["Current selection", "Selected data window"],
-            help="Current selection uses all visible errors for the chosen vessel/rules. Selected data window uses the exported data-window errors.",
-        )
-    with limit_col:
-        template_max_items = st.number_input("Max issue lines", min_value=3, max_value=50, value=12, step=1)
+    if errors_scope.empty:
+        st.success("No validation issues were found for the current filtered selection.")
+    else:
+        st.info(f"Message includes {len(errors_scope)} issue(s) from the current filtered selection.")
 
-    template_errors = recent_errors_scope if template_data_scope == "Selected data window" else errors_scope
-    template_checked_rows = checked_rows_scope
-    if template_data_scope == "Selected data window" and not checked_rows_scope.empty and "report_date" in checked_rows_scope.columns:
-        template_dates = sorted(template_errors["report_date"].dropna().unique().tolist()) if not template_errors.empty and "report_date" in template_errors.columns else []
-        template_checked_rows = filter_to_report_dates(checked_rows_scope, template_dates) if template_dates else checked_rows_scope
-
-    template_by_rule = (
-        template_errors.groupby("issue_type", dropna=False).size().reset_index(name="count")
-        if not template_errors.empty and "issue_type" in template_errors.columns
-        else pd.DataFrame(columns=["issue_type", "count"])
-    )
-    template_text = build_message_template(
-        selected_template_name,
-        template_errors,
-        template_checked_rows,
-        template_by_rule,
-        vessel_summary,
-        selected_vessel,
-        data_window_caption,
-        max_items=int(template_max_items),
-    )
-
-    st.text_area("Copy-ready message", value=template_text, height=380)
+    st.text_input("Suggested subject", value=captain_message_subject)
+    st.text_area("Copy-ready message", value=captain_message_text, height=460)
     st.download_button(
-        "Download selected message as TXT",
-        data=template_text.encode("utf-8-sig"),
-        file_name="noon_report_message_template.txt",
+        "Download Captain / Chief Engineer message as TXT",
+        data=f"Subject: {captain_message_subject}\n\n{captain_message_text}".encode("utf-8-sig"),
+        file_name="noon_report_captain_chief_engineer_message.txt",
         mime="text/plain",
         use_container_width=True,
     )
