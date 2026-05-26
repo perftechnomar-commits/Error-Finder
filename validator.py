@@ -37,7 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dg_cons_high_mt": 13.0,
     "dg_cons_low_mt": 1.0,
     "dg_sfc_g_per_kwh": 220.0,
-    "dg_cons_vs_load_buffer_mt": 2.0,
+    "dg_cons_vs_load_buffer_mt": 2.0
 }
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
