@@ -174,6 +174,237 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Copy-paste message template helpers
+# -----------------------------------------------------------------------------
+
+def clean_message_value(value: object, default: str = "-") -> str:
+    """Return a compact, readable string for message templates."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text if text else default
+
+
+def format_template_report_date(value: object) -> str:
+    """Format a report date for operational messages."""
+    if value is None:
+        return "-"
+    try:
+        if pd.isna(value):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    try:
+        return format_report_date(value)
+    except Exception:  # noqa: BLE001 - keep message generation robust
+        return clean_message_value(value)
+
+
+def get_template_date_label(errors_df: pd.DataFrame, checked_rows_df: pd.DataFrame) -> str:
+    """Build a date label from the currently selected validation scope."""
+    dates = []
+    for df in (errors_df, checked_rows_df):
+        if not df.empty and "report_date" in df.columns:
+            dates.extend(df["report_date"].dropna().tolist())
+    if not dates:
+        return "selected report window"
+    unique_dates = sorted(set(dates))
+    if len(unique_dates) == 1:
+        return format_template_report_date(unique_dates[0])
+    return f"{format_template_report_date(unique_dates[0])} - {format_template_report_date(unique_dates[-1])}"
+
+
+def build_issue_lines(errors_df: pd.DataFrame, max_items: int = 12) -> str:
+    """Create bullet lines for the most relevant validation findings."""
+    if errors_df.empty:
+        return "- No validation errors found for this selection."
+
+    sort_cols = [c for c in ["report_date", "severity", "ship_name", "issue_type"] if c in errors_df.columns]
+    view = errors_df.copy()
+    if sort_cols:
+        ascending = [False if c == "report_date" else True for c in sort_cols]
+        view = view.sort_values(sort_cols, ascending=ascending)
+
+    lines = []
+    for _, row in view.head(int(max_items)).iterrows():
+        parts = []
+        if "report_date" in view.columns:
+            parts.append(format_template_report_date(row.get("report_date")))
+        if "ship_name" in view.columns:
+            parts.append(clean_message_value(row.get("ship_name")))
+        if "report_type" in view.columns:
+            parts.append(clean_message_value(row.get("report_type")))
+        if "excel_row" in view.columns:
+            parts.append(f"Excel row {clean_message_value(row.get('excel_row'))}")
+
+        issue = clean_message_value(row.get("issue_type"))
+        message = clean_message_value(row.get("message"), "")
+        value = clean_message_value(row.get("value"), "")
+        expected = clean_message_value(row.get("expected"), "")
+
+        detail = issue
+        if message:
+            detail += f": {message}"
+        if value and expected:
+            detail += f" | Value: {value} | Expected: {expected}"
+        elif value:
+            detail += f" | Value: {value}"
+        elif expected:
+            detail += f" | Expected: {expected}"
+
+        prefix = " | ".join(p for p in parts if p and p != "-")
+        lines.append(f"- {prefix} | {detail}" if prefix else f"- {detail}")
+
+    remaining = len(view) - len(lines)
+    if remaining > 0:
+        lines.append(f"- ... plus {remaining} more issue(s) in the exported Excel report.")
+    return "\n".join(lines)
+
+
+def build_rule_summary_lines(by_rule_df: pd.DataFrame, max_items: int = 8) -> str:
+    """Create a compact top-rule summary for message templates."""
+    if by_rule_df.empty or not {"issue_type", "count"}.issubset(by_rule_df.columns):
+        return "- No error categories found."
+    view = by_rule_df.sort_values("count", ascending=False).head(int(max_items))
+    return "\n".join(f"- {row.issue_type}: {int(row.count)}" for row in view.itertuples(index=False))
+
+
+def build_vessel_attention_lines(vessel_summary_df: pd.DataFrame, max_items: int = 8) -> str:
+    """Summarize vessels requiring attention for fleet-level messages."""
+    needed = {"Vessel", "total_errors", "high_severity_errors"}
+    if vessel_summary_df.empty or not needed.issubset(vessel_summary_df.columns):
+        return "- No vessel summary available for this selection."
+    view = vessel_summary_df.sort_values(["high_severity_errors", "total_errors"], ascending=[False, False]).head(int(max_items))
+    lines = []
+    for row in view.itertuples(index=False):
+        if int(row.total_errors) <= 0:
+            continue
+        lines.append(f"- {row.Vessel}: {int(row.total_errors)} issue(s), {int(row.high_severity_errors)} high severity")
+    return "\n".join(lines) if lines else "- No vessels with validation issues in this selection."
+
+
+def build_message_template(
+    template_name: str,
+    errors_df: pd.DataFrame,
+    checked_rows_df: pd.DataFrame,
+    by_rule_df: pd.DataFrame,
+    vessel_summary_df: pd.DataFrame,
+    selected_vessel_name: str,
+    data_window_text: str,
+    max_items: int = 12,
+) -> str:
+    """Generate a copy-ready operational message from the current app selection."""
+    vessel_label = selected_vessel_name if selected_vessel_name != "All vessels" else "fleet / current selection"
+    date_label = get_template_date_label(errors_df, checked_rows_df)
+    total_rows = len(checked_rows_df)
+    rows_with_issues = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) > 0).sum()) if total_rows else 0
+    total_issues = len(errors_df)
+    high_issues = int(errors_df["severity"].astype(str).eq("High").sum()) if not errors_df.empty and "severity" in errors_df.columns else 0
+    issue_lines = build_issue_lines(errors_df, max_items=max_items)
+    rule_lines = build_rule_summary_lines(by_rule_df)
+    vessel_lines = build_vessel_attention_lines(vessel_summary_df)
+
+    if total_issues == 0:
+        no_issue_body = (
+            f"Noon report validation completed for {vessel_label}.\n\n"
+            f"Report window: {date_label}\n"
+            f"{data_window_text}\n"
+            f"Checked rows: {total_rows}\n\n"
+            "No validation issues were found for the current selection."
+        )
+        if template_name == "Vessel follow-up email":
+            return (
+                f"Subject: Noon report validation - {vessel_label} - {date_label}\n\n"
+                "Good day Captain,\n\n"
+                f"{no_issue_body}\n\n"
+                "No action is required from your side at this stage.\n\n"
+                "Best regards,"
+            )
+        return no_issue_body
+
+    if template_name == "Vessel follow-up email":
+        return (
+            f"Subject: Noon report validation follow-up - {vessel_label} - {date_label}\n\n"
+            "Good day Captain,\n\n"
+            f"Please review the below noon report validation findings for {vessel_label}.\n\n"
+            "Summary:\n"
+            f"- Report window: {date_label}\n"
+            f"- {data_window_text}\n"
+            f"- Checked rows: {total_rows}\n"
+            f"- Rows with issues: {rows_with_issues}\n"
+            f"- Total issues: {total_issues}\n"
+            f"- High severity issues: {high_issues}\n\n"
+            "Main findings:\n"
+            f"{issue_lines}\n\n"
+            "Kindly check the highlighted items in the exported Excel report and revert with confirmation/corrections where required.\n\n"
+            "Best regards,"
+        )
+
+    if template_name == "Internal fleet summary":
+        return (
+            "Team,\n\n"
+            f"Noon report validation has been completed for {vessel_label}.\n\n"
+            "Summary:\n"
+            f"- Report window: {date_label}\n"
+            f"- {data_window_text}\n"
+            f"- Checked rows: {total_rows}\n"
+            f"- Rows with issues: {rows_with_issues}\n"
+            f"- Total issues: {total_issues}\n"
+            f"- High severity issues: {high_issues}\n\n"
+            "Top error categories:\n"
+            f"{rule_lines}\n\n"
+            "Vessels requiring attention:\n"
+            f"{vessel_lines}\n\n"
+            "Detailed findings are available in the exported Excel validation report."
+        )
+
+    return (
+        f"Noon checker completed for {vessel_label} ({date_label}). "
+        f"Found {total_issues} issue(s) across {rows_with_issues} row(s); high severity: {high_issues}.\n\n"
+        "Main items:\n"
+        f"{issue_lines}\n\n"
+        "Please review the exported Excel report and update/correct the relevant noon report entries."
+    )
+
+
+def build_message_templates_df(
+    errors_df: pd.DataFrame,
+    checked_rows_df: pd.DataFrame,
+    by_rule_df: pd.DataFrame,
+    vessel_summary_df: pd.DataFrame,
+    selected_vessel_name: str,
+    data_window_text: str,
+    max_items: int = 12,
+) -> pd.DataFrame:
+    """Return all standard templates as a dataframe, ready for optional Excel export."""
+    template_names = ["Vessel follow-up email", "Internal fleet summary", "Short Teams/WhatsApp message"]
+    rows = []
+    for template_name in template_names:
+        rows.append(
+            {
+                "template_name": template_name,
+                "vessel_scope": selected_vessel_name,
+                "message": build_message_template(
+                    template_name,
+                    errors_df,
+                    checked_rows_df,
+                    by_rule_df,
+                    vessel_summary_df,
+                    selected_vessel_name,
+                    data_window_text,
+                    max_items=max_items,
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
 # Department auto-source helpers
 # -----------------------------------------------------------------------------
 
@@ -774,6 +1005,15 @@ with export_tab:
     combined_for_export["daily_kpis"] = daily_kpis_scope
     combined_for_export["by_severity"] = by_severity_scope
     combined_for_export["status_summary"] = status_summary_scope
+    combined_for_export["message_templates"] = build_message_templates_df(
+        errors_scope,
+        checked_rows_scope,
+        by_rule_scope,
+        vessel_summary,
+        selected_vessel,
+        data_window_caption,
+        max_items=12,
+    )
 
     excel_bytes = results_to_excel_bytes(combined_for_export)
     st.download_button(
@@ -797,5 +1037,58 @@ with export_tab:
         data=recent_errors_scope.to_csv(index=False).encode("utf-8-sig"),
         file_name="noon_report_errors_selected_data_window.csv",
         mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.subheader("Copy-paste message templates")
+    st.caption(
+        "Templates are generated from the same vessel/rule/report-day selection used by the export buttons above. "
+        "Use the text box to copy the message into email, Teams, WhatsApp, or another system."
+    )
+
+    template_col, scope_col, limit_col = st.columns([2, 1.3, 1])
+    with template_col:
+        selected_template_name = st.selectbox(
+            "Template type",
+            ["Vessel follow-up email", "Internal fleet summary", "Short Teams/WhatsApp message"],
+        )
+    with scope_col:
+        template_data_scope = st.selectbox(
+            "Template data scope",
+            ["Current selection", "Selected data window"],
+            help="Current selection uses all visible errors for the chosen vessel/rules. Selected data window uses the exported data-window errors.",
+        )
+    with limit_col:
+        template_max_items = st.number_input("Max issue lines", min_value=3, max_value=50, value=12, step=1)
+
+    template_errors = recent_errors_scope if template_data_scope == "Selected data window" else errors_scope
+    template_checked_rows = checked_rows_scope
+    if template_data_scope == "Selected data window" and not checked_rows_scope.empty and "report_date" in checked_rows_scope.columns:
+        template_dates = sorted(template_errors["report_date"].dropna().unique().tolist()) if not template_errors.empty and "report_date" in template_errors.columns else []
+        template_checked_rows = filter_to_report_dates(checked_rows_scope, template_dates) if template_dates else checked_rows_scope
+
+    template_by_rule = (
+        template_errors.groupby("issue_type", dropna=False).size().reset_index(name="count")
+        if not template_errors.empty and "issue_type" in template_errors.columns
+        else pd.DataFrame(columns=["issue_type", "count"])
+    )
+    template_text = build_message_template(
+        selected_template_name,
+        template_errors,
+        template_checked_rows,
+        template_by_rule,
+        vessel_summary,
+        selected_vessel,
+        data_window_caption,
+        max_items=int(template_max_items),
+    )
+
+    st.text_area("Copy-ready message", value=template_text, height=380)
+    st.download_button(
+        "Download selected message as TXT",
+        data=template_text.encode("utf-8-sig"),
+        file_name="noon_report_message_template.txt",
+        mime="text/plain",
         use_container_width=True,
     )
