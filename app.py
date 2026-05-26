@@ -154,7 +154,6 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
     preferred_cols = [
         "report_date",
         "file_name",
-        "excel_row",
         "report_id",
         "ship_name",
         "report_type",
