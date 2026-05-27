@@ -11,7 +11,7 @@ import streamlit as st
 
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_FIX_MERGE_TEMPLATE"
+APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_DG_OPTIMISATION"
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -813,6 +813,23 @@ with st.sidebar:
         config["boiler_cons_max_mt"] = st.number_input("Boiler cons max MT", value=float(DEFAULT_CONFIG["boiler_cons_max_mt"]), step=0.5)
         config["dg_cons_high_mt"] = st.number_input("DG cons high MT", value=float(DEFAULT_CONFIG["dg_cons_high_mt"]), step=0.5)
         config["dg_cons_low_mt"] = st.number_input("DG cons low MT", value=float(DEFAULT_CONFIG["dg_cons_low_mt"]), step=0.1)
+
+    with st.expander("DG optimisation", expanded=False):
+        config["dg_power_running_threshold_kw"] = st.number_input(
+            "DG considered running above kW",
+            value=float(DEFAULT_CONFIG.get("dg_power_running_threshold_kw", 10.0)),
+            step=1.0,
+            help="Used by the Multiple DGs rule. A DG with power above this value is counted as running.",
+        )
+        config["dg_optimization_load_factor"] = st.number_input(
+            "DG optimisation load factor",
+            value=float(DEFAULT_CONFIG.get("dg_optimization_load_factor", 0.70)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            format="%.2f",
+            help="Used in the formula: sum(DG power / DG MCR) < factor * (running DGs - 1).",
+        )
 
     with st.expander("Advanced", expanded=False):
         config["sfoc_min"] = st.number_input("SFOC min", value=float(DEFAULT_CONFIG["sfoc_min"]), step=5.0)
