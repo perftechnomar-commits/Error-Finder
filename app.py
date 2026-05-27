@@ -814,21 +814,30 @@ with st.sidebar:
         config["dg_cons_high_mt"] = st.number_input("DG cons high MT", value=float(DEFAULT_CONFIG["dg_cons_high_mt"]), step=0.5)
         config["dg_cons_low_mt"] = st.number_input("DG cons low MT", value=float(DEFAULT_CONFIG["dg_cons_low_mt"]), step=0.1)
 
-    with st.expander("DG optimisation", expanded=False):
+    with st.expander("Multiple DGs rule", expanded=False):
         config["dg_power_running_threshold_kw"] = st.number_input(
-            "DG considered running above kW",
+            "DG counted as running above kW",
             value=float(DEFAULT_CONFIG.get("dg_power_running_threshold_kw", 10.0)),
             step=1.0,
-            help="Used by the Multiple DGs rule. A DG with power above this value is counted as running.",
+            key="dg_power_running_threshold_kw_input",
+            help=(
+                "Used by the Multiple DGs rule. A DG with power above this value is counted as running. "
+                "The result changes only when this value crosses the actual DG1/DG2/DG3/DG4 power values in the report."
+            ),
         )
         config["dg_optimization_load_factor"] = st.number_input(
-            "DG optimisation load factor",
+            "Multiple DGs load factor",
             value=float(DEFAULT_CONFIG.get("dg_optimization_load_factor", 0.70)),
             min_value=0.0,
             max_value=1.0,
             step=0.05,
             format="%.2f",
+            key="dg_optimization_load_factor_input",
             help="Used in the formula: sum(DG power / DG MCR) < factor * (running DGs - 1).",
+        )
+        st.caption(
+            "Tip: the kW threshold controls only how many DGs are counted as running. "
+            "The exported Checked Rows sheet includes Multiple DGs diagnostic columns so you can verify the DG threshold and formula result."
         )
 
     with st.expander("Advanced", expanded=False):
