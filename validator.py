@@ -59,10 +59,10 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "dg2_hours": ["DG2 Running Hours [hh:mm]", "DG2 Running Hours"],
     "dg3_hours": ["DG3 Running Hours [hh:mm]", "DG3 Running Hours"],
     "dg4_hours": ["DG4 Running Hours [hh:mm]", "DG4 Running Hours"],
-    "dg1_power": ["DG1 Power [kW]", "DG1 Power", "DG 1 Power [kW]", "DG 1 Power", "DG1 Load [kW]", "DG1 Load", "AE1 Power [kW]", "AE1 Power", "AE 1 Power [kW]", "AE 1 Power"],
-    "dg2_power": ["DG2 Power [kW]", "DG2 Power", "DG 2 Power [kW]", "DG 2 Power", "DG2 Load [kW]", "DG2 Load", "AE2 Power [kW]", "AE2 Power", "AE 2 Power [kW]", "AE 2 Power"],
-    "dg3_power": ["DG3 Power [kW]", "DG3 Power", "DG 3 Power [kW]", "DG 3 Power", "DG3 Load [kW]", "DG3 Load", "AE3 Power [kW]", "AE3 Power", "AE 3 Power [kW]", "AE 3 Power"],
-    "dg4_power": ["DG4 Power [kW]", "DG4 Power", "DG 4 Power [kW]", "DG 4 Power", "DG4 Load [kW]", "DG4 Load", "AE4 Power [kW]", "AE4 Power", "AE 4 Power [kW]", "AE 4 Power"],
+    "dg1_power": ["DG1 Power [kW]", "DG1 Power", "DG1_POWER", "DG_1_POWER", "DG 1 Power [kW]", "DG 1 Power", "DG 1 POWER", "DG1 Load [kW]", "DG1 Load", "DG1_LOAD", "DG 1 Load", "DG1 Power Output", "DG1 Power Output [kW]", "D/G1 Power", "D/G 1 Power", "D/G 1 Power [kW]", "AE1 Power [kW]", "AE1 Power", "AE1_POWER", "AE 1 Power [kW]", "AE 1 Power", "AE1 Power Output", "AE1 Power Output [kW]"],
+    "dg2_power": ["DG2 Power [kW]", "DG2 Power", "DG2_POWER", "DG_2_POWER", "DG 2 Power [kW]", "DG 2 Power", "DG 2 POWER", "DG2 Load [kW]", "DG2 Load", "DG2_LOAD", "DG 2 Load", "DG2 Power Output", "DG2 Power Output [kW]", "D/G2 Power", "D/G 2 Power", "D/G 2 Power [kW]", "AE2 Power [kW]", "AE2 Power", "AE2_POWER", "AE 2 Power [kW]", "AE 2 Power", "AE2 Power Output", "AE2 Power Output [kW]"],
+    "dg3_power": ["DG3 Power [kW]", "DG3 Power", "DG3_POWER", "DG_3_POWER", "DG 3 Power [kW]", "DG 3 Power", "DG 3 POWER", "DG3 Load [kW]", "DG3 Load", "DG3_LOAD", "DG 3 Load", "DG3 Power Output", "DG3 Power Output [kW]", "D/G3 Power", "D/G 3 Power", "D/G 3 Power [kW]", "AE3 Power [kW]", "AE3 Power", "AE3_POWER", "AE 3 Power [kW]", "AE 3 Power", "AE3 Power Output", "AE3 Power Output [kW]"],
+    "dg4_power": ["DG4 Power [kW]", "DG4 Power", "DG4_POWER", "DG_4_POWER", "DG 4 Power [kW]", "DG 4 Power", "DG 4 POWER", "DG4 Load [kW]", "DG4 Load", "DG4_LOAD", "DG 4 Load", "DG4 Power Output", "DG4 Power Output [kW]", "D/G4 Power", "D/G 4 Power", "D/G 4 Power [kW]", "AE4 Power [kW]", "AE4 Power", "AE4_POWER", "AE 4 Power [kW]", "AE 4 Power", "AE4 Power Output", "AE4 Power Output [kW]"],
     "sfoc": ["SFOC [gr/Kwh]", "SFOC [g/kWh]", "SFOC"],
     "torque_power": ["Power from Torque Meter [kW]", "Power from Torque Meter", "Torque Power"],
     "fw_produced": ["FW Produced [cbm]", "FW Produced"],
@@ -482,6 +482,10 @@ def validate_noon_report(
     diff_count = int(clean_diff.count())
 
     errors: List[ValidationError] = []
+    dg_optimization_running_counts = [np.nan] * n
+    dg_optimization_load_ratio_sums = [np.nan] * n
+    dg_optimization_limits = [np.nan] * n
+    dg_optimization_status = [""] * n
 
     def add(idx: int, rule_id: str, message: str, value: Any, expected: str, column_keys: Iterable[str]) -> None:
         columns = [mapping.get(k) or k for k in column_keys]
@@ -568,7 +572,8 @@ def validate_noon_report(
         # Formula requested:
         # sum(DG_POWER / DG_MCR) < load_factor * (running_dg_count - 1)
         # where a DG is treated as running when DG_POWER > running_threshold_kw.
-        vessel_mcr = get_vessel_fixed_mcr(col(df, mapping, "ship_name").iloc[i])
+        vessel_name_for_mcr = col(df, mapping, "ship_name").iloc[i]
+        vessel_mcr = get_vessel_fixed_mcr(vessel_name_for_mcr)
         if vessel_mcr and vessel_mcr.get("dg_mcr"):
             running_threshold_kw = float(cfg.get("dg_power_running_threshold_kw", 10.0))
             load_factor = float(cfg.get("dg_optimization_load_factor", 0.70))
@@ -592,13 +597,32 @@ def validate_noon_report(
                 if is_running:
                     running_count += 1
 
+                running_label = "counted running" if is_running else "not counted"
                 if is_valid_positive_number(mcr_value):
                     mcr_kw = float(mcr_value)
+                    # Keep the left side exactly as requested: all DG power values
+                    # are included in the sum, while the threshold only controls
+                    # the running-DG count on the right side.
                     load_ratio = power_kw / mcr_kw
                     load_ratio_sum += load_ratio
-                    display_terms.append(f"DG{pos}: {fmt_num(power_kw, 0)}/{fmt_num(mcr_kw, 0)} kW ({fmt_pct(load_ratio)})")
+                    display_terms.append(
+                        f"DG{pos}: {fmt_num(power_kw, 0)}/{fmt_num(mcr_kw, 0)} kW ({fmt_pct(load_ratio)}, {running_label})"
+                    )
                 elif is_running:
                     missing_mcr_for_running.append(f"DG{pos}")
+                else:
+                    display_terms.append(f"DG{pos}: {fmt_num(power_kw, 0)} kW ({running_label}, MCR not set)")
+
+            if any_power_available:
+                threshold = load_factor * max(running_count - 1, 0)
+                dg_optimization_running_counts[i] = running_count
+                dg_optimization_load_ratio_sums[i] = load_ratio_sum
+                dg_optimization_limits[i] = threshold
+                dg_optimization_status[i] = (
+                    f"DG threshold > {fmt_num(running_threshold_kw, 0)} kW; "
+                    f"running DGs = {running_count}; relative load = {fmt_pct(load_ratio_sum)}; "
+                    f"limit = {fmt_pct(threshold)}"
+                )
 
             if any_power_available and running_count > 1 and not missing_mcr_for_running:
                 threshold = load_factor * (running_count - 1)
@@ -606,11 +630,13 @@ def validate_noon_report(
                     add(
                         i,
                         "R25",
-                        f"Multiple DG optimisation check: {running_count} DGs running; combined relative load = {fmt_pct(load_ratio_sum)}",
+                        f"Multiple DG optimisation check: {running_count} DGs counted running above {fmt_num(running_threshold_kw, 0)} kW; combined relative load = {fmt_pct(load_ratio_sum)}",
                         "; ".join(display_terms),
-                        f">= {fmt_pct(threshold)} based on {fmt_num(load_factor, 2)} * ({running_count} - 1); consider if fewer DGs can cover the required load",
+                        f">= {fmt_pct(threshold)} based on {fmt_num(load_factor, 2)} * ({running_count} - 1). A DG is counted running only when DG power > {fmt_num(running_threshold_kw, 0)} kW; consider if fewer DGs can cover the required load",
                         ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
                     )
+        else:
+            dg_optimization_status[i] = f"No fixed AE/DG MCR found for vessel: {safe_display(vessel_name_for_mcr)}"
 
         # R18 Low MGO ROB
         if pd.notna(rob_mgo.iloc[i]) and rob_mgo.iloc[i] < cfg["mgo_rob_min_mt"]:
@@ -651,6 +677,10 @@ def validate_noon_report(
         "end_gmt": col(df, mapping, "end_gmt"),
         "state_name": col(df, mapping, "state_name"),
         "scope": np.where(sea, "Sea", "Not sea"),
+        "dg_optimization_running_count": dg_optimization_running_counts,
+        "dg_optimization_load_ratio_sum": dg_optimization_load_ratio_sums,
+        "dg_optimization_limit": dg_optimization_limits,
+        "dg_optimization_status": dg_optimization_status,
     }
     checked_rows = pd.DataFrame(base_cols)
     for rule in RULES:
