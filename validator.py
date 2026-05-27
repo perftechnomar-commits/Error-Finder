@@ -105,7 +105,7 @@ RULES: List[Dict[str, str]] = [
 
 
 # Fixed vessel ME/AE MCR values from ME-AE.xlsx.
-# AE Power Output is used as the DG MCR for the DG optimisation rule.
+# AE Power Output is used as the DG MCR for the Multiple DGs rule.
 VESSEL_FIXED_MCR: Dict[str, Dict[str, Any]] = {'AGIOS DIMITRIOS': {'dg_mcr': [2245.0, 2245.0, 2245.0, 2245.0], 'me_mcr': 57200.0},
  'ANTHEA Y': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
  'ATETI': {'dg_mcr': [2960.0, 2960.0, 2960.0, None], 'me_mcr': 68520.0},
@@ -482,10 +482,10 @@ def validate_noon_report(
     diff_count = int(clean_diff.count())
 
     errors: List[ValidationError] = []
-    dg_optimization_running_counts = [np.nan] * n
-    dg_optimization_load_ratio_sums = [np.nan] * n
-    dg_optimization_limits = [np.nan] * n
-    dg_optimization_status = [""] * n
+    multiple_dgs_running_counts = [np.nan] * n
+    multiple_dgs_load_ratio_sums = [np.nan] * n
+    multiple_dgs_limits = [np.nan] * n
+    multiple_dgs_status = [""] * n
 
     def add(idx: int, rule_id: str, message: str, value: Any, expected: str, column_keys: Iterable[str]) -> None:
         columns = [mapping.get(k) or k for k in column_keys]
@@ -568,7 +568,7 @@ def validate_noon_report(
             if over:
                 add(i, "R10", "a DG's Hours is more then Time since last reporting", "; ".join(over), f"Each DG running hours <= {time_since_last.iloc[i]}", ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"])
 
-        # R25 Multiple DGs / DG optimisation
+        # R25 Multiple DGs
         # Formula requested:
         # sum(DG_POWER / DG_MCR) < load_factor * (running_dg_count - 1)
         # where a DG is treated as running when DG_POWER > running_threshold_kw.
@@ -615,10 +615,10 @@ def validate_noon_report(
 
             if any_power_available:
                 threshold = load_factor * max(running_count - 1, 0)
-                dg_optimization_running_counts[i] = running_count
-                dg_optimization_load_ratio_sums[i] = load_ratio_sum
-                dg_optimization_limits[i] = threshold
-                dg_optimization_status[i] = (
+                multiple_dgs_running_counts[i] = running_count
+                multiple_dgs_load_ratio_sums[i] = load_ratio_sum
+                multiple_dgs_limits[i] = threshold
+                multiple_dgs_status[i] = (
                     f"DG threshold > {fmt_num(running_threshold_kw, 0)} kW; "
                     f"running DGs = {running_count}; relative load = {fmt_pct(load_ratio_sum)}; "
                     f"limit = {fmt_pct(threshold)}"
@@ -630,13 +630,13 @@ def validate_noon_report(
                     add(
                         i,
                         "R25",
-                        f"Multiple DG optimisation check: {running_count} DGs counted running above {fmt_num(running_threshold_kw, 0)} kW; combined relative load = {fmt_pct(load_ratio_sum)}",
+                        f"Multiple DGs check: {running_count} DGs counted running above {fmt_num(running_threshold_kw, 0)} kW; combined relative load = {fmt_pct(load_ratio_sum)}",
                         "; ".join(display_terms),
                         f">= {fmt_pct(threshold)} based on {fmt_num(load_factor, 2)} * ({running_count} - 1). A DG is counted running only when DG power > {fmt_num(running_threshold_kw, 0)} kW; consider if fewer DGs can cover the required load",
                         ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
                     )
         else:
-            dg_optimization_status[i] = f"No fixed AE/DG MCR found for vessel: {safe_display(vessel_name_for_mcr)}"
+            multiple_dgs_status[i] = f"No fixed AE/DG MCR found for vessel: {safe_display(vessel_name_for_mcr)}"
 
         # R18 Low MGO ROB
         if pd.notna(rob_mgo.iloc[i]) and rob_mgo.iloc[i] < cfg["mgo_rob_min_mt"]:
@@ -677,10 +677,10 @@ def validate_noon_report(
         "end_gmt": col(df, mapping, "end_gmt"),
         "state_name": col(df, mapping, "state_name"),
         "scope": np.where(sea, "Sea", "Not sea"),
-        "dg_optimization_running_count": dg_optimization_running_counts,
-        "dg_optimization_load_ratio_sum": dg_optimization_load_ratio_sums,
-        "dg_optimization_limit": dg_optimization_limits,
-        "dg_optimization_status": dg_optimization_status,
+        "multiple_dgs_running_count": multiple_dgs_running_counts,
+        "multiple_dgs_load_ratio_sum": multiple_dgs_load_ratio_sums,
+        "multiple_dgs_limit": multiple_dgs_limits,
+        "multiple_dgs_status": multiple_dgs_status,
     }
     checked_rows = pd.DataFrame(base_cols)
     for rule in RULES:
