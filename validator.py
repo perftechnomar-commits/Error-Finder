@@ -38,6 +38,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dg_cons_low_mt": 1.0,
     "dg_sfc_g_per_kwh": 220.0,
     "dg_cons_vs_load_buffer_mt": 2.0,
+    "dg_power_running_threshold_kw": 10.0,
+    "dg_optimization_load_factor": 0.70,
 }
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
@@ -57,6 +59,10 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "dg2_hours": ["DG2 Running Hours [hh:mm]", "DG2 Running Hours"],
     "dg3_hours": ["DG3 Running Hours [hh:mm]", "DG3 Running Hours"],
     "dg4_hours": ["DG4 Running Hours [hh:mm]", "DG4 Running Hours"],
+    "dg1_power": ["DG1 Power [kW]", "DG1 Power", "DG 1 Power [kW]", "DG 1 Power", "DG1 Load [kW]", "DG1 Load", "AE1 Power [kW]", "AE1 Power", "AE 1 Power [kW]", "AE 1 Power"],
+    "dg2_power": ["DG2 Power [kW]", "DG2 Power", "DG 2 Power [kW]", "DG 2 Power", "DG2 Load [kW]", "DG2 Load", "AE2 Power [kW]", "AE2 Power", "AE 2 Power [kW]", "AE 2 Power"],
+    "dg3_power": ["DG3 Power [kW]", "DG3 Power", "DG 3 Power [kW]", "DG 3 Power", "DG3 Load [kW]", "DG3 Load", "AE3 Power [kW]", "AE3 Power", "AE 3 Power [kW]", "AE 3 Power"],
+    "dg4_power": ["DG4 Power [kW]", "DG4 Power", "DG 4 Power [kW]", "DG 4 Power", "DG4 Load [kW]", "DG4 Load", "AE4 Power [kW]", "AE4 Power", "AE 4 Power [kW]", "AE 4 Power"],
     "sfoc": ["SFOC [gr/Kwh]", "SFOC [g/kWh]", "SFOC"],
     "torque_power": ["Power from Torque Meter [kW]", "Power from Torque Meter", "Torque Power"],
     "fw_produced": ["FW Produced [cbm]", "FW Produced"],
@@ -94,8 +100,142 @@ RULES: List[Dict[str, str]] = [
     {"rule_id": "R24A", "issue_type": "DG Cons >13", "severity": "Medium", "description": "DG consumption exceeds fixed high threshold."},
     {"rule_id": "R24B", "issue_type": "High DG Cons vs Load", "severity": "Medium", "description": "DG consumption is high compared with electric load."},
     {"rule_id": "R24C", "issue_type": "DG Cons <1", "severity": "Medium", "description": "Sea rows with DG consumption below minimum threshold."},
-    {"rule_id": "R25", "issue_type": "Multiple DGs", "severity": "Medium", "description": "Multiple DGs running while total electric load is too low to justify extra generator usage."},
+    {"rule_id": "R25", "issue_type": "Multiple DGs", "severity": "Medium", "description": "Multiple DGs running at low combined relative load based on vessel-specific AE/DG MCR; fewer DGs may be sufficient."},
 ]
+
+
+# Fixed vessel ME/AE MCR values from ME-AE.xlsx.
+# AE Power Output is used as the DG MCR for the DG optimisation rule.
+VESSEL_FIXED_MCR: Dict[str, Dict[str, Any]] = {'AGIOS DIMITRIOS': {'dg_mcr': [2245.0, 2245.0, 2245.0, 2245.0], 'me_mcr': 57200.0},
+ 'ANTHEA Y': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
+ 'ATETI': {'dg_mcr': [2960.0, 2960.0, 2960.0, None], 'me_mcr': 68520.0},
+ 'ATHENA': {'dg_mcr': [1360.0, 1360.0, 1360.0, 1360.0], 'me_mcr': 28880.0},
+ 'BREMERHAVEN EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
+ 'CAPTAIN THANASIS I': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
+ 'CMA CGM ALCAZAR': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 41130.0},
+ 'CMA CGM AMERICA': {'dg_mcr': [2526.0, 2526.0, 2526.0, 2526.0], 'me_mcr': 40040.0},
+ 'CMA CGM JAMAICA': {'dg_mcr': [1800.0, 1800.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
+ 'CMA CGM SAMBHAR': {'dg_mcr': [2526.0, 2526.0, 2526.0, 2526.0], 'me_mcr': 40040.0},
+ 'CMA CGM THALASSA': {'dg_mcr': [3192.0, 3192.0, 3192.0, 3192.0], 'me_mcr': 72240.0},
+ 'COLOMBIA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
+ 'CONSTANTINOS P II': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
+ 'COSTA RICA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
+ 'CZECH': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
+ 'DOLPHIN II': {'dg_mcr': [2550.0, 2550.0, 2550.0, None], 'me_mcr': 57910.0},
+ 'ELENI T': {'dg_mcr': [1810.0, 1810.0, 1810.0, 1810.0], 'me_mcr': 36560.0},
+ 'EPAMINONDAS': {'dg_mcr': [3840.0, 3840.0, 3840.0, 3840.0], 'me_mcr': 65880.0},
+ 'GSL ALEXANDRA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'GSL ALICE': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
+ 'GSL ARCADIA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
+ "GSL CHATEAU D'...": {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 41130.0},
+ 'GSL CHLOE': {'dg_mcr': [1760.0, 1980.0, 1980.0, 1760.0], 'me_mcr': 21660.0},
+ 'GSL CHRISTEL ELISAB...': {'dg_mcr': [2900.0, 2900.0, 2900.0, None], 'me_mcr': 57100.0},
+ 'GSL CHRISTEN': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
+ 'GSL DOROTHEA': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 54840.0},
+ 'GSL EFFIE': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'GSL ELEFTHERIA': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
+ 'GSL ELENI': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2100.0], 'me_mcr': 68640.0},
+ 'GSL ELIZABETH': {'dg_mcr': [1400.0, 1400.0, 1400.0, 950.0], 'me_mcr': 21170.0},
+ 'GSL GRANIA': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2100.0], 'me_mcr': 68640.0},
+ 'GSL KALLIOPI': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2700.0], 'me_mcr': 68640.0},
+ 'GSL KITHIRA': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
+ 'GSL LALO': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
+ 'GSL LYDIA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'GSL MAMITSA EX MATS...': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
+ 'GSL MAREN': {'dg_mcr': [1760.0, 1760.0, 1980.0, 1980.0], 'me_mcr': 21660.0},
+ 'GSL MARIA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54880.0},
+ 'GSL MELINA': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
+ 'GSL MELITA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
+ 'GSL MERCER': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
+ 'GSL MYNY': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
+ 'GSL NICOLETTA': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
+ 'GSL NINGBO': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
+ 'GSL ROSSI': {'dg_mcr': [1760.0, 1760.0, 1760.0, 1760.0], 'me_mcr': 27120.0},
+ 'GSL SOFIA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'GSL SUSAN': {'dg_mcr': [1800.0, 1800.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
+ 'GSL SYROS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 3912.0], 'me_mcr': 44040.0},
+ 'GSL TEGEA': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 54840.0},
+ 'GSL TINOS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
+ 'GSL TRIPOLI': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
+ 'GSL VALERIE': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
+ 'GSL VINIA': {'dg_mcr': [2900.0, 2900.0, 2900.0, None], 'me_mcr': 57100.0},
+ 'GSL VIOLETTA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
+ 'IAN H': {'dg_mcr': [2320.0, 2320.0, 2320.0, 2320.0], 'me_mcr': 54900.0},
+ 'ISTANBUL EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
+ 'JAMAICA EXPRESS': {'dg_mcr': [2530.0, 2530.0, 2530.0, 2530.0], 'me_mcr': 32900.0},
+ 'JULIE': {'dg_mcr': [1275.0, 1275.0, 1275.0, 1275.0], 'me_mcr': 24824.0},
+ 'KOI': {'dg_mcr': [None, None, None, None], 'me_mcr': 68640.0},
+ 'KOSTAS K': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'KUMASI': {'dg_mcr': [1275.0, 1275.0, 1275.0, 1275.0], 'me_mcr': 24824.0},
+ 'MAIRA': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
+ 'MANET': {'dg_mcr': [1530.0, 1530.0, 1530.0, 1530.0], 'me_mcr': 24840.0},
+ 'MARIA Y': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
+ 'MARIANNA I': {'dg_mcr': [3600.0, 3600.0, 3600.0, 3600.0], 'me_mcr': 65880.0},
+ 'MELINA': {'dg_mcr': [1810.0, 1810.0, 1810.0, 1810.0], 'me_mcr': 36560.0},
+ 'MEXICO EXPRESS': {'dg_mcr': [2530.0, 2530.0, 2530.0, 2530.0], 'me_mcr': 32900.0},
+ 'MSC QINGDAO': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
+ 'MSC ROMA': {'dg_mcr': [2880.0, 2880.0, 2880.0, 2880.0], 'me_mcr': 68520.0},
+ 'MSC TIANJIN': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
+ 'MYNY': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
+ 'NEWYORKER': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
+ 'NICARAGUA EXPRESS E...': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
+ 'NIKOLAS': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
+ 'ORCA I': {'dg_mcr': [2550.0, 2550.0, 2550.0, None], 'me_mcr': 57910.0},
+ 'PANAMA EXPRESS EX K...': {'dg_mcr': [3500.0, 3500.0, 3000.0, 3000.0], 'me_mcr': 33670.0},
+ 'SPYROS V': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
+ 'STAMATIS B': {'dg_mcr': [1421.0, 1421.0, 2100.0, 2100.0], 'me_mcr': 36450.0},
+ 'SYDNEY EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
+ 'TINA I': {'dg_mcr': [2354.0, 2354.0, 2354.0, 2354.0], 'me_mcr': 57200.0},
+ 'TONSBERG': {'dg_mcr': [2395.0, 2395.0, 2000.0, 2000.0], 'me_mcr': 54900.0},
+ 'TORRANCE EX ZIM HAI...': {'dg_mcr': [3080.0, 3080.0, 3080.0, None], 'me_mcr': 54840.0},
+ 'ZIM NORFOLK': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
+ 'ZIM XIAMEN EX MAIRA...': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
+ 'ZOI': {'dg_mcr': [2395.0, 2395.0, 2720.0, 2720.0], 'me_mcr': 54900.0}}
+
+
+def normalize_vessel_key(value: Any) -> str:
+    """Normalize vessel names for matching fixed MCR values."""
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().upper().split())
+
+
+VESSEL_FIXED_MCR_BY_KEY: Dict[str, Dict[str, Any]] = {
+    normalize_vessel_key(name): values for name, values in VESSEL_FIXED_MCR.items()
+}
+
+
+def get_vessel_fixed_mcr(vessel_name: Any) -> Optional[Dict[str, Any]]:
+    """Return fixed ME/AE MCR data for a vessel, if available.
+
+    ME-AE.xlsx contains some long vessel names shortened with ``...``.
+    The first lookup is exact; the second lookup treats the part before
+    ``...`` as a prefix so full source names can still match the stored
+    AE power-output values.
+    """
+    key = normalize_vessel_key(vessel_name)
+    if not key:
+        return None
+
+    exact = VESSEL_FIXED_MCR_BY_KEY.get(key)
+    if exact is not None:
+        return exact
+
+    for stored_key, values in VESSEL_FIXED_MCR_BY_KEY.items():
+        if "..." in stored_key:
+            prefix = stored_key.split("...", 1)[0].strip()
+            if prefix and key.startswith(prefix):
+                return values
+
+    return None
+
+
+def is_valid_positive_number(value: Any) -> bool:
+    """True when value can be used as a positive numeric denominator."""
+    try:
+        return pd.notna(value) and float(value) > 0
+    except Exception:
+        return False
 
 
 @dataclass
@@ -335,6 +475,7 @@ def validate_noon_report(
     speed_over_ground = to_number(col(df, mapping, "speed_over_ground"))
     boiler_cons_24h = to_number(col(df, mapping, "boiler_cons_24h"))
     dg_cons_24h = to_number(col(df, mapping, "dg_cons_24h"))
+    dg_power = {k: to_number(col(df, mapping, k)) for k in ["dg1_power", "dg2_power", "dg3_power", "dg4_power"]}
 
     clean_diff = difference_pct[(difference_pct >= cfg["difference_pct_clean_min"]) & (difference_pct <= cfg["difference_pct_clean_max"]) & (difference_pct != 0)]
     diff_avg = clean_diff.mean() if len(clean_diff) else np.nan
@@ -423,33 +564,53 @@ def validate_noon_report(
             if over:
                 add(i, "R10", "a DG's Hours is more then Time since last reporting", "; ".join(over), f"Each DG running hours <= {time_since_last.iloc[i]}", ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"])
 
-            # R25 Multiple DGs
-            # Legacy checker logic:
-            # counter = sum(DG running hours) / (Time Since Last Report + 0.001)
-            # if counter > 1, more than one DG was effectively running.
-            # It is suspicious when total electric load is lower than:
-            # 70% * (counter - 1) * vessel single-DG max kW.
-            if pd.notna(time_since_last.iloc[i]) and time_since_last.iloc[i] > 0 and pd.notna(total_dg_power.iloc[i]):
-                valid_dg_hours = [
-                    series.iloc[i]
-                    for series in dg_hours.values()
-                    if pd.notna(series.iloc[i])
-                ]
-                dg_hours_sum = sum(valid_dg_hours) if valid_dg_hours else np.nan
-                if pd.notna(dg_hours_sum):
-                    dg_running_ratio = dg_hours_sum / (time_since_last.iloc[i] + 0.001)
-                    single_dg_kw = float(cfg.get("single_dg_max_kw", 2900.0))
-                    load_factor = float(cfg.get("multiple_dg_load_factor", 0.70))
-                    expected_min_load = load_factor * (dg_running_ratio - 1) * single_dg_kw
-                    if dg_running_ratio > 1 and total_dg_power.iloc[i] < expected_min_load:
-                        add(
-                            i,
-                            "R25",
-                            f"Multiple DGs in use, vessel single DG kW = {fmt_num(single_dg_kw, 0)}",
-                            total_dg_power.iloc[i],
-                            f">= {fmt_num(expected_min_load, 0)} kW based on DG running ratio {fmt_num(dg_running_ratio, 2)}",
-                            ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
-                        )
+        # R25 Multiple DGs / DG optimisation
+        # Formula requested:
+        # sum(DG_POWER / DG_MCR) < load_factor * (running_dg_count - 1)
+        # where a DG is treated as running when DG_POWER > running_threshold_kw.
+        vessel_mcr = get_vessel_fixed_mcr(col(df, mapping, "ship_name").iloc[i])
+        if vessel_mcr and vessel_mcr.get("dg_mcr"):
+            running_threshold_kw = float(cfg.get("dg_power_running_threshold_kw", 10.0))
+            load_factor = float(cfg.get("dg_optimization_load_factor", 0.70))
+            dg_mcr_values = vessel_mcr["dg_mcr"]
+            dg_power_values = [dg_power[key].iloc[i] for key in ["dg1_power", "dg2_power", "dg3_power", "dg4_power"]]
+
+            running_count = 0
+            load_ratio_sum = 0.0
+            display_terms = []
+            missing_mcr_for_running = []
+            any_power_available = False
+
+            for pos, (power_value, mcr_value) in enumerate(zip(dg_power_values, dg_mcr_values), start=1):
+                if pd.isna(power_value):
+                    power_kw = 0.0
+                else:
+                    any_power_available = True
+                    power_kw = float(power_value)
+
+                is_running = power_kw > running_threshold_kw
+                if is_running:
+                    running_count += 1
+
+                if is_valid_positive_number(mcr_value):
+                    mcr_kw = float(mcr_value)
+                    load_ratio = power_kw / mcr_kw
+                    load_ratio_sum += load_ratio
+                    display_terms.append(f"DG{pos}: {fmt_num(power_kw, 0)}/{fmt_num(mcr_kw, 0)} kW ({fmt_pct(load_ratio)})")
+                elif is_running:
+                    missing_mcr_for_running.append(f"DG{pos}")
+
+            if any_power_available and running_count > 1 and not missing_mcr_for_running:
+                threshold = load_factor * (running_count - 1)
+                if load_ratio_sum < threshold:
+                    add(
+                        i,
+                        "R25",
+                        f"Multiple DG optimisation check: {running_count} DGs running; combined relative load = {fmt_pct(load_ratio_sum)}",
+                        "; ".join(display_terms),
+                        f">= {fmt_pct(threshold)} based on {fmt_num(load_factor, 2)} * ({running_count} - 1); consider if fewer DGs can cover the required load",
+                        ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
+                    )
 
         # R18 Low MGO ROB
         if pd.notna(rob_mgo.iloc[i]) and rob_mgo.iloc[i] < cfg["mgo_rob_min_mt"]:
@@ -528,7 +689,7 @@ def validate_noon_report(
         "R24A": ["dg_cons_24h"],
         "R24B": ["dg_cons_24h", "total_dg_power"],
         "R24C": ["report_type", "state_name", "dg_cons_24h"],
-        "R25": ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours", "total_dg_power"],
+        "R25": ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
     }
     for rule in RULES:
         missing_cols = [k for k in required_by_rule.get(rule["rule_id"], []) if mapping.get(k) is None]
