@@ -1,6 +1,6 @@
 # Noon Report Checker - Streamlit
 
-Streamlit εφαρμογή για έλεγχο ANTHEA-style Noon Report Excel αρχείων με τους κανόνες validation που προσαρμόστηκαν από το Error Finder v2.25.
+Streamlit εφαρμογή για έλεγχο Noon Report Excel αρχείων με τους κανόνες validation που προσαρμόστηκαν από το Error Finder v2.25.
 
 ## Τι κάνει
 
