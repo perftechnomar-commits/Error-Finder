@@ -1,842 +1,1349 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import hashlib
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import numpy as np
+import requests
+import altair as alt
 import pandas as pd
+import streamlit as st
+
+from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
+
+APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_DG_OPTIMISATION"
+
+st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
+
+st.title("Noon Report Checker")
 
 
-# Default thresholds copied from the ANTHEA Y adaptation of Error Finder v2.25.
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "date_max_days_ahead": 1,
-    "low_steaming_hours": 8.0,
-    "low_fw_steaming_hours": 20.0,
-    "slip_min": -0.07,
-    "slip_max": 0.20,
-    "me_load_min": 0.10,
-    "me_load_max": 1.00,
-    "electric_load_min_kw": 100.0,
-    "electric_load_max_kw": 7000.0,
-    "sfoc_min": 160.0,
-    "sfoc_max": 280.0,
-    "torque_power_min_kw": 3400.0,
-    "torque_power_max_kw": 40000.0,
-    "fw_produced_min_cbm": 10.0,
-    "fw_consumed_max_cbm": 10.0,
-    "sludge_factor_of_total_consumption": 0.015,
-    "mgo_rob_min_mt": 50.0,
-    "difference_pct_clean_min": -0.60,
-    "difference_pct_clean_max": 0.70,
-    "difference_pct_avg_band": 0.13,
-    "difference_pct_min_count": 20,
-    "distance_tolerance_pct": 0.05,
-    "boiler_cons_max_mt": 5.0,
-    "dg_cons_high_mt": 13.0,
-    "dg_cons_low_mt": 1.0,
-    "dg_sfc_g_per_kwh": 220.0,
-    "dg_cons_vs_load_buffer_mt": 2.0,
-    "dg_power_running_threshold_kw": 10.0,
-    "dg_optimization_load_factor": 0.70,
-}
+# -----------------------------------------------------------------------------
+# General helpers
+# -----------------------------------------------------------------------------
 
-COLUMN_ALIASES: Dict[str, List[str]] = {
-    "report_id": ["ReportId", "Report ID"],
-    "ship_name": ["ShipName", "Ship Name", "Vessel"],
-    "fleet": ["Fleet", "Fleet Group", "FleetGroup"],
-    "report_type": ["Report Type"],
-    "start_gmt": ["Start Date & Time GMT", "Start Date Time GMT", "Start GMT"],
-    "end_gmt": ["End Date & Time GMT", "End Date Time GMT", "End GMT"],
-    "time_since_last": ["Time Since Last Report"],
-    "state_name": ["State Name", "State"],
-    "steaming_time": ["Steaming Time Since Last Report [hh:mm]", "Steaming Time Since Last Report", "Steaming Time"],
-    "calculated_slip": ["Calculated Slip", "Slip"],
-    "wind_force": ["Wind Speed [bft]", "Wind Force", "Wind Force [bft]"],
-    "me_load": ["ME Load [%MCR]", "ME Load %MCR", "MCR", "ME Load"],
-    "total_dg_power": ["Total DG Power [kW]", "Total DG Power", "Electric Load"],
-    "dg1_hours": ["DG1 Running Hours [hh:mm]", "DG1 Running Hours"],
-    "dg2_hours": ["DG2 Running Hours [hh:mm]", "DG2 Running Hours"],
-    "dg3_hours": ["DG3 Running Hours [hh:mm]", "DG3 Running Hours"],
-    "dg4_hours": ["DG4 Running Hours [hh:mm]", "DG4 Running Hours"],
-    "dg1_power": ["DG1 Power [kW]", "DG1 Power", "DG1_POWER", "DG_1_POWER", "DG 1 Power [kW]", "DG 1 Power", "DG 1 POWER", "DG1 Load [kW]", "DG1 Load", "DG1_LOAD", "DG 1 Load", "DG1 Power Output", "DG1 Power Output [kW]", "D/G1 Power", "D/G 1 Power", "D/G 1 Power [kW]", "AE1 Power [kW]", "AE1 Power", "AE1_POWER", "AE 1 Power [kW]", "AE 1 Power", "AE1 Power Output", "AE1 Power Output [kW]"],
-    "dg2_power": ["DG2 Power [kW]", "DG2 Power", "DG2_POWER", "DG_2_POWER", "DG 2 Power [kW]", "DG 2 Power", "DG 2 POWER", "DG2 Load [kW]", "DG2 Load", "DG2_LOAD", "DG 2 Load", "DG2 Power Output", "DG2 Power Output [kW]", "D/G2 Power", "D/G 2 Power", "D/G 2 Power [kW]", "AE2 Power [kW]", "AE2 Power", "AE2_POWER", "AE 2 Power [kW]", "AE 2 Power", "AE2 Power Output", "AE2 Power Output [kW]"],
-    "dg3_power": ["DG3 Power [kW]", "DG3 Power", "DG3_POWER", "DG_3_POWER", "DG 3 Power [kW]", "DG 3 Power", "DG 3 POWER", "DG3 Load [kW]", "DG3 Load", "DG3_LOAD", "DG 3 Load", "DG3 Power Output", "DG3 Power Output [kW]", "D/G3 Power", "D/G 3 Power", "D/G 3 Power [kW]", "AE3 Power [kW]", "AE3 Power", "AE3_POWER", "AE 3 Power [kW]", "AE 3 Power", "AE3 Power Output", "AE3 Power Output [kW]"],
-    "dg4_power": ["DG4 Power [kW]", "DG4 Power", "DG4_POWER", "DG_4_POWER", "DG 4 Power [kW]", "DG 4 Power", "DG 4 POWER", "DG4 Load [kW]", "DG4 Load", "DG4_LOAD", "DG 4 Load", "DG4 Power Output", "DG4 Power Output [kW]", "D/G4 Power", "D/G 4 Power", "D/G 4 Power [kW]", "AE4 Power [kW]", "AE4 Power", "AE4_POWER", "AE 4 Power [kW]", "AE 4 Power", "AE4 Power Output", "AE4 Power Output [kW]"],
-    "sfoc": ["SFOC [gr/Kwh]", "SFOC [g/kWh]", "SFOC"],
-    "torque_power": ["Power from Torque Meter [kW]", "Power from Torque Meter", "Torque Power"],
-    "fw_produced": ["FW Produced [cbm]", "FW Produced"],
-    "fw_consumed": ["FW Consumed [cbm]", "FW Consumed"],
-    "sludge_incinerated": ["Sludge Incinerated / Evaporated [cbm]", "Sludge Incinerated", "Sludge Evaporated"],
-    "sludge_produced": ["Sludge Produced [cbm]", "Sludge Produced"],
-    "total_consumption_24h": ["Total Consumption 24 Hours [MT]", "Total Consumption 24H [MT]", "Total Consumption [MT]"],
-    "rob_mgo": ["ROB MGO [MT]", "MGO ROB [MT]", "ROB MGO"],
-    "reefer_load": ["Estimated Reefer Load", "Reefer Load"],
-    "difference_pct": ["Difference Percentage", "Consumption Difference Percentage", "Difference %"],
-    "distance_over_ground": ["Distance Over Ground [nm]", "Distance Over Ground", "Distance [nm]"],
-    "speed_over_ground": ["Speed over ground [kn GPS]", "Speed Over Ground [kn GPS]", "Speed over ground", "GPS Speed"],
-    "boiler_cons_24h": ["Consumption Boiler 24 Hours [MT]", "Boiler Cons 24 Hours [MT]", "Boiler Consumption [MT]"],
-    "dg_cons_24h": ["Consumption DGs 24 Hours [MT]", "DG Cons 24 Hours [MT]", "DG Consumption [MT]"],
-}
-
-RULES: List[Dict[str, str]] = [
-    {"rule_id": "R02", "issue_type": "Date", "severity": "High", "description": "Start Date & Time GMT must be a valid date and not more than tomorrow."},
-    {"rule_id": "R04", "issue_type": "Low Steaming", "severity": "Medium", "description": "Sea rows with Steaming Time below the threshold."},
-    {"rule_id": "R05", "issue_type": "Slip", "severity": "Medium", "description": "Sea rows where Calculated Slip is outside the accepted band."},
-    {"rule_id": "R06", "issue_type": "MCR/ME Load", "severity": "Medium", "description": "Sea rows where ME Load [%MCR] is outside the accepted band."},
-    {"rule_id": "R07", "issue_type": "Electric Load", "severity": "Medium", "description": "Total DG Power [kW] is outside the accepted range."},
-    {"rule_id": "R10", "issue_type": "DG Hours", "severity": "High", "description": "Any DG running hours exceed Time Since Last Report."},
-    {"rule_id": "R11", "issue_type": "SFOC", "severity": "Medium", "description": "Sea rows with non-zero SFOC outside the accepted range."},
-    {"rule_id": "R12", "issue_type": "Power from Torque Meter", "severity": "Medium", "description": "Sea rows with torque-meter power outside the accepted range."},
-    {"rule_id": "R13", "issue_type": "Low FW Production", "severity": "Medium", "description": "Sea rows with low FW production during long steaming."},
-    {"rule_id": "R14", "issue_type": "High FW Consumption", "severity": "Medium", "description": "Sea rows with high FW consumption."},
-    {"rule_id": "R15", "issue_type": "Sludge Incinerated", "severity": "Low", "description": "Sea rows where sludge incinerated/evaporated is zero or blank."},
-    {"rule_id": "R16", "issue_type": "Excessive Sludge", "severity": "Medium", "description": "Sludge produced is greater than allowed share of total consumption."},
-    {"rule_id": "R18", "issue_type": "Low MGO ROB", "severity": "Medium", "description": "ROB MGO [MT] is below threshold."},
-    {"rule_id": "R20", "issue_type": "Reefer Load", "severity": "Low", "description": "Estimated Reefer Load is present but non-numeric."},
-    {"rule_id": "R21", "issue_type": "Consumption % Outlier", "severity": "Medium", "description": "Difference Percentage is outside clean average +/- band."},
-    {"rule_id": "R22", "issue_type": "Distance vs Speed*Time", "severity": "Medium", "description": "Distance is outside tolerance vs Steaming Time * Speed over ground."},
-    {"rule_id": "R23", "issue_type": "Boiler Cons", "severity": "Medium", "description": "Boiler consumption exceeds threshold."},
-    {"rule_id": "R24A", "issue_type": "DG Cons >13", "severity": "Medium", "description": "DG consumption exceeds fixed high threshold."},
-    {"rule_id": "R24B", "issue_type": "High DG Cons vs Load", "severity": "Medium", "description": "DG consumption is high compared with electric load."},
-    {"rule_id": "R24C", "issue_type": "DG Cons <1", "severity": "Medium", "description": "Sea rows with DG consumption below minimum threshold."},
-    {"rule_id": "R25", "issue_type": "Multiple DGs", "severity": "Medium", "description": "Multiple DGs running at low combined relative load based on vessel-specific AE/DG MCR; fewer DGs may be sufficient."},
-]
-
-
-# Fixed vessel ME/AE MCR values from ME-AE.xlsx.
-# AE Power Output is used as the DG MCR for the Multiple DGs rule.
-VESSEL_FIXED_MCR: Dict[str, Dict[str, Any]] = {'AGIOS DIMITRIOS': {'dg_mcr': [2245.0, 2245.0, 2245.0, 2245.0], 'me_mcr': 57200.0},
- 'ANTHEA Y': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
- 'ATETI': {'dg_mcr': [2960.0, 2960.0, 2960.0, None], 'me_mcr': 68520.0},
- 'ATHENA I': {'dg_mcr': [1360.0, 1360.0, 1360.0, 1360.0], 'me_mcr': 28880.0},
- 'BREMERHAVEN EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
- 'CAPTAIN THANASIS I': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
- 'CMA CGM ALCAZAR': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 41130.0},
- 'CMA CGM AMERICA': {'dg_mcr': [2526.0, 2526.0, 2526.0, 2526.0], 'me_mcr': 40040.0},
- 'CMA CGM JAMAICA': {'dg_mcr': [1800.0, 1800.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
- 'CMA CGM SAMBHAR': {'dg_mcr': [2526.0, 2526.0, 2526.0, 2526.0], 'me_mcr': 40040.0},
- 'CMA CGM THALASSA': {'dg_mcr': [3192.0, 3192.0, 3192.0, 3192.0], 'me_mcr': 72240.0},
- 'COLOMBIA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
- 'CONSTANTINOS P II': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
- 'COSTA RICA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
- 'CZECH': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
- 'DOLPHIN II': {'dg_mcr': [2550.0, 2550.0, 2550.0, None], 'me_mcr': 57910.0},
- 'ELENI T': {'dg_mcr': [1810.0, 1810.0, 1810.0, 1810.0], 'me_mcr': 36560.0},
- 'EPAMINONDAS': {'dg_mcr': [3840.0, 3840.0, 3840.0, 3840.0], 'me_mcr': 65880.0},
- 'GSL ALEXANDRA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'GSL ALICE': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
- 'GSL ARCADIA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
- "GSL CHATEAU D'...": {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 41130.0},
- 'GSL CHLOE': {'dg_mcr': [1760.0, 1980.0, 1980.0, 1760.0], 'me_mcr': 21660.0},
- 'GSL CHRISTEL ELISAB...': {'dg_mcr': [2900.0, 2900.0, 2900.0, None], 'me_mcr': 57100.0},
- 'GSL CHRISTEN': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
- 'GSL DOROTHEA': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 54840.0},
- 'GSL EFFIE': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'GSL ELEFTHERIA': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
- 'GSL ELENI': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2100.0], 'me_mcr': 68640.0},
- 'GSL ELIZABETH': {'dg_mcr': [1400.0, 1400.0, 1400.0, 950.0], 'me_mcr': 21170.0},
- 'GSL GRANIA': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2100.0], 'me_mcr': 68640.0},
- 'GSL KALLIOPI': {'dg_mcr': [2100.0, 2700.0, 2700.0, 2700.0], 'me_mcr': 68640.0},
- 'GSL KITHIRA': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
- 'GSL LALO': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
- 'GSL LYDIA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'GSL MAMITSA': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
- 'GSL MAREN': {'dg_mcr': [1760.0, 1760.0, 1980.0, 1980.0], 'me_mcr': 21660.0},
- 'GSL MARIA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54880.0},
- 'GSL MELINA': {'dg_mcr': [1684.0, 1684.0, 1684.0, 1684.0], 'me_mcr': 25040.0},
- 'GSL MELITA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
- 'GSL MERCER': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
- 'GSL MYNY': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
- 'GSL NICOLETTA': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
- 'GSL NINGBO': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
- 'GSL ROSSI': {'dg_mcr': [1760.0, 1760.0, 1760.0, 1760.0], 'me_mcr': 27120.0},
- 'GSL SOFIA': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'GSL SUSAN': {'dg_mcr': [1800.0, 1800.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
- 'GSL SYROS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 3912.0], 'me_mcr': 44040.0},
- 'GSL TEGEA': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 54840.0},
- 'GSL TINOS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
- 'GSL TRIPOLI': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4000.0], 'me_mcr': 40040.0},
- 'GSL VALERIE': {'dg_mcr': [1680.0, 1680.0, 1680.0, 1680.0], 'me_mcr': 25270.0},
- 'GSL VINIA': {'dg_mcr': [2900.0, 2900.0, 2900.0, None], 'me_mcr': 57100.0},
- 'GSL VIOLETTA': {'dg_mcr': [3088.0, 3088.0, 3088.0, None], 'me_mcr': 54840.0},
- 'IAN H': {'dg_mcr': [2320.0, 2320.0, 2320.0, 2320.0], 'me_mcr': 54900.0},
- 'ISTANBUL EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
- 'JAMAICA EXPRESS': {'dg_mcr': [2530.0, 2530.0, 2530.0, 2530.0], 'me_mcr': 32900.0},
- 'JULIE': {'dg_mcr': [1275.0, 1275.0, 1275.0, 1275.0], 'me_mcr': 24824.0},
- 'KOI': {'dg_mcr': [None, None, None, None], 'me_mcr': 68640.0},
- 'KOSTAS K': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'KUMASI': {'dg_mcr': [1275.0, 1275.0, 1275.0, 1275.0], 'me_mcr': 24824.0},
- 'MAIRA': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
- 'MANET': {'dg_mcr': [1530.0, 1530.0, 1530.0, 1530.0], 'me_mcr': 24840.0},
- 'MARIA Y': {'dg_mcr': [3600.0, 2700.0, 3600.0, None], 'me_mcr': 63000.0},
- 'MARIANNA I': {'dg_mcr': [3600.0, 3600.0, 3600.0, 3600.0], 'me_mcr': 65880.0},
- 'MELINA': {'dg_mcr': [1810.0, 1810.0, 1810.0, 1810.0], 'me_mcr': 36560.0},
- 'MEXICO EXPRESS': {'dg_mcr': [2530.0, 2530.0, 2530.0, 2530.0], 'me_mcr': 32900.0},
- 'MSC QINGDAO': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
- 'MSC ROMA': {'dg_mcr': [2880.0, 2880.0, 2880.0, 2880.0], 'me_mcr': 68520.0},
- 'MSC TIANJIN': {'dg_mcr': [3160.0, 3160.0, 3160.0, 3160.0], 'me_mcr': 68520.0},
- 'MYNY': {'dg_mcr': [2942.0, 2942.0, 2942.0, 2942.0], 'me_mcr': 62587.0},
- 'NEWYORKER': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
- 'NICARAGUA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3500.0, 3000.0], 'me_mcr': 33670.0},
- 'NIKOLAS': {'dg_mcr': [1280.0, 1280.0, 1280.0, 780.0], 'me_mcr': 20930.0},
- 'ORCA I': {'dg_mcr': [2550.0, 2550.0, 2550.0, None], 'me_mcr': 57910.0},
- 'PANAMA EXPRESS': {'dg_mcr': [3500.0, 3500.0, 3000.0, 3000.0], 'me_mcr': 33670.0},
- 'SPYROS V': {'dg_mcr': [2400.0, 2400.0, 2400.0, 2400.0], 'me_mcr': 36560.0},
- 'STAMATIS B': {'dg_mcr': [1421.0, 1421.0, 2100.0, 2100.0], 'me_mcr': 36450.0},
- 'SYDNEY EXPRESS': {'dg_mcr': [4500.0, 4500.0, 4500.0, 4500.0], 'me_mcr': 38590.0},
- 'TINA I': {'dg_mcr': [2354.0, 2354.0, 2354.0, 2354.0], 'me_mcr': 57200.0},
- 'TONSBERG': {'dg_mcr': [2395.0, 2395.0, 2000.0, 2000.0], 'me_mcr': 54900.0},
- 'TORRANCE': {'dg_mcr': [3080.0, 3080.0, 3080.0, None], 'me_mcr': 54840.0},
- 'ZIM NORFOLK': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
- 'ZIM XIAMEN': {'dg_mcr': [4000.0, 4000.0, 4000.0, 4000.0], 'me_mcr': 41400.0},
- 'ZOI': {'dg_mcr': [2395.0, 2395.0, 2720.0, 2720.0], 'me_mcr': 54900.0}}
-
-
-def normalize_vessel_key(value: Any) -> str:
-    """Normalize vessel names for matching fixed MCR values."""
-    if value is None:
-        return ""
-    return " ".join(str(value).strip().upper().split())
-
-
-VESSEL_FIXED_MCR_BY_KEY: Dict[str, Dict[str, Any]] = {
-    normalize_vessel_key(name): values for name, values in VESSEL_FIXED_MCR.items()
-}
-
-
-def get_vessel_fixed_mcr(vessel_name: Any) -> Optional[Dict[str, Any]]:
-    """Return fixed ME/AE MCR data for a vessel, if available.
-
-    ME-AE.xlsx contains some long vessel names shortened with ``...``.
-    The first lookup is exact; the second lookup treats the part before
-    ``...`` as a prefix so full source names can still match the stored
-    AE power-output values.
-    """
-    key = normalize_vessel_key(vessel_name)
-    if not key:
-        return None
-
-    exact = VESSEL_FIXED_MCR_BY_KEY.get(key)
-    if exact is not None:
-        return exact
-
-    for stored_key, values in VESSEL_FIXED_MCR_BY_KEY.items():
-        if "..." in stored_key:
-            prefix = stored_key.split("...", 1)[0].strip()
-            if prefix and key.startswith(prefix):
-                return values
-
-    return None
-
-
-def is_valid_positive_number(value: Any) -> bool:
-    """True when value can be used as a positive numeric denominator."""
-    try:
-        return pd.notna(value) and float(value) > 0
-    except Exception:
-        return False
-
-
-@dataclass
-class ValidationError:
-    file_name: str
-    sheet_name: str
-    excel_row: int
-    report_id: Any
-    ship_name: Any
-    fleet: Any
-    report_type: Any
-    start_gmt: Any
-    end_gmt: Any
-    state_name: Any
-    rule_id: str
-    issue_type: str
-    severity: str
-    message: str
-    value: Any
-    expected: str
-    columns: str
-
-
-def read_noon_excel(file_obj: Any, file_name: str = "uploaded.xlsx", sheet_name: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
-    """Read an ANTHEA-style noon report Excel file.
-
-    The function prefers a sheet called 'Table'. If it does not exist, it falls back
-    to 'Query1' and then to the first worksheet. The returned dataframe preserves
-    the original column names.
-    """
-    content = file_obj.read() if hasattr(file_obj, "read") else open(file_obj, "rb").read()
-    xls = pd.ExcelFile(BytesIO(content), engine="openpyxl")
-    if sheet_name and sheet_name in xls.sheet_names:
-        selected = sheet_name
-    elif "Table" in xls.sheet_names:
-        selected = "Table"
-    elif "Query1" in xls.sheet_names:
-        selected = "Query1"
-    else:
-        selected = xls.sheet_names[0]
-    df = pd.read_excel(xls, sheet_name=selected, engine="openpyxl")
-    df = df.dropna(how="all").reset_index(drop=True)
-    df.attrs["file_name"] = file_name
-    df.attrs["sheet_name"] = selected
-    return df, selected
-
-
-def _normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().lower().replace("\n", " ").replace("  ", " ")
-
-
-def map_columns(df: pd.DataFrame) -> Tuple[Dict[str, Optional[str]], Dict[str, List[str]]]:
-    normalized_to_original = {_normalize_text(col): col for col in df.columns}
-    mapping: Dict[str, Optional[str]] = {}
-    missing: Dict[str, List[str]] = {}
-    for key, aliases in COLUMN_ALIASES.items():
-        found = None
-        for alias in aliases:
-            if _normalize_text(alias) in normalized_to_original:
-                found = normalized_to_original[_normalize_text(alias)]
-                break
-        mapping[key] = found
-        if found is None:
-            missing[key] = aliases
-    return mapping, missing
-
-
-def col(df: pd.DataFrame, mapping: Dict[str, Optional[str]], key: str) -> pd.Series:
-    name = mapping.get(key)
-    if name is None or name not in df.columns:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    return df[name]
-
-
-def to_number(series: pd.Series) -> pd.Series:
-    """Convert numbers, Excel dates/times, timedeltas, and HH:MM strings to floats.
-
-    For time-like values, returns hours when the value looks like a time duration.
-    Numeric Excel values are left as numeric, matching the ANTHEA export where
-    time durations are already expressed in hours.
-    """
-    if series.empty:
-        return pd.Series(dtype="float64")
-
-    def one(v: Any) -> float:
-        if pd.isna(v):
-            return np.nan
-        if isinstance(v, pd.Timedelta):
-            return v.total_seconds() / 3600.0
-        if isinstance(v, timedelta):
-            return v.total_seconds() / 3600.0
-        if isinstance(v, datetime):
-            # This is unusual for duration columns; return NaN instead of the serial date.
-            return np.nan
-        if isinstance(v, (int, float, np.integer, np.floating)):
-            return float(v)
-        text = str(v).strip()
-        if text == "":
-            return np.nan
-        if ":" in text:
-            parts = text.split(":")
-            try:
-                if len(parts) == 2:
-                    h, m = float(parts[0]), float(parts[1])
-                    return h + m / 60.0
-                if len(parts) == 3:
-                    h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
-                    return h + m / 60.0 + s / 3600.0
-            except ValueError:
-                pass
-        text = text.replace("%", "").replace(",", "")
-        try:
-            val = float(text)
-            # If user pasted 20% as text, convert to 0.20.
-            if "%" in str(v):
-                return val / 100.0
-            return val
-        except ValueError:
-            return np.nan
-
-    return series.map(one).astype("float64")
-
-
-def to_date(series: pd.Series) -> pd.Series:
+def parse_report_datetime(series: pd.Series) -> pd.Series:
+    """Parse report datetimes robustly for filtering and KPI charts."""
+    if series is None or series.empty:
+        return pd.Series(dtype="datetime64[ns]")
     return pd.to_datetime(series, errors="coerce")
 
 
-def is_blank_value(value: Any) -> bool:
+def with_report_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with report_datetime and report_date columns based on start_gmt."""
+    out = df.copy()
+    if "start_gmt" not in out.columns:
+        out["report_datetime"] = pd.NaT
+        out["report_date"] = pd.NaT
+        return out
+    out["report_datetime"] = parse_report_datetime(out["start_gmt"])
+    out["report_date"] = out["report_datetime"].dt.date
+    return out
+
+
+def filter_last_report_days(errors_df: pd.DataFrame, days: int = 2) -> tuple[pd.DataFrame, list]:
+    """Keep errors from the latest N report dates in the loaded data, not from today's date."""
+    if errors_df.empty or "start_gmt" not in errors_df.columns:
+        return errors_df.copy(), []
+    dated = with_report_dates(errors_df)
+    available_dates = sorted([d for d in dated["report_date"].dropna().unique().tolist()])
+    last_dates = available_dates[-int(days):] if available_dates else []
+    recent = dated[dated["report_date"].isin(last_dates)].copy()
+    return recent, last_dates
+
+
+def get_latest_report_dates(df: pd.DataFrame, days: int) -> list:
+    """Return the latest N report dates from a dated dataframe."""
+    if df.empty or "report_date" not in df.columns:
+        return []
+    available_dates = sorted([d for d in df["report_date"].dropna().unique().tolist()])
+    return available_dates[-int(days):] if available_dates else []
+
+
+def filter_to_report_dates(df: pd.DataFrame, report_dates: list) -> pd.DataFrame:
+    """Filter a dated dataframe to selected report dates."""
+    if df.empty or "report_date" not in df.columns:
+        return df.copy()
+    if not report_dates:
+        return df.iloc[0:0].copy()
+    return df[df["report_date"].isin(report_dates)].copy()
+
+
+def format_report_date(value: object) -> str:
+    """Format report dates as d/m/yy for compact dashboard captions."""
     if value is None or pd.isna(value):
-        return True
-    if isinstance(value, str) and value.strip() == "":
-        return True
-    return False
-
-
-def safe_display(value: Any) -> Any:
-    if pd.isna(value) if not isinstance(value, (list, tuple, dict)) else False:
         return ""
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return value.strftime("%Y-%m-%d %H:%M")
-    return value
+    dt = pd.to_datetime(value)
+    return f"{dt.day}/{dt.month}/{dt.strftime('%y')}"
 
 
-def fmt_pct(v: Any) -> str:
-    try:
-        if pd.isna(v):
-            return ""
-        return f"{float(v):.1%}"
-    except Exception:
-        return str(v)
+def get_data_window_caption(rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> str:
+    """Build a small caption showing the report-date window available in the loaded source."""
+    date_values = []
+    for df in (rows_df, errors_df):
+        if not df.empty and "report_date" in df.columns:
+            date_values.extend(df["report_date"].dropna().tolist())
+
+    if not date_values:
+        return "Report days: no report dates found"
+
+    dates = sorted(set(date_values))
+    start_date = dates[0]
+    end_date = dates[-1]
+
+    if start_date == end_date:
+        return f"Report days: {format_report_date(start_date)}"
+
+    return f"Report days from {format_report_date(start_date)} - {format_report_date(end_date)}"
 
 
-def fmt_num(v: Any, decimals: int = 1) -> str:
-    try:
-        if pd.isna(v):
-            return ""
-        return f"{float(v):.{decimals}f}"
-    except Exception:
-        return str(v)
+def build_daily_kpis(checked_rows: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
+    """Build daily operational validation KPIs."""
+    if checked_rows.empty or "start_gmt" not in checked_rows.columns:
+        return pd.DataFrame()
+
+    rows = with_report_dates(checked_rows).dropna(subset=["report_date"]).copy()
+    if rows.empty:
+        return pd.DataFrame()
+
+    daily_rows = (
+        rows.groupby("report_date", dropna=False)
+        .agg(
+            report_rows=("excel_row", "count"),
+            rows_with_errors=("issue_count", lambda s: int((s > 0).sum())),
+            rows_ok=("issue_count", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+    )
+
+    if errors_df.empty:
+        daily_errors = pd.DataFrame({"report_date": daily_rows["report_date"], "total_errors": 0})
+    else:
+        err = with_report_dates(errors_df).dropna(subset=["report_date"])
+        daily_errors = err.groupby("report_date", dropna=False).size().reset_index(name="total_errors")
+
+    daily = daily_rows.merge(daily_errors, on="report_date", how="left")
+    daily["total_errors"] = daily["total_errors"].fillna(0).astype(int)
+    daily["error_row_rate"] = daily["rows_with_errors"] / daily["report_rows"].replace(0, pd.NA)
+    daily["avg_errors_per_report"] = daily["total_errors"] / daily["report_rows"].replace(0, pd.NA)
+    daily["report_date"] = daily["report_date"].astype(str)
+    return daily.sort_values("report_date", ascending=False)
 
 
-def issue_meta(rule_id: str) -> Tuple[str, str]:
-    for rule in RULES:
-        if rule["rule_id"] == rule_id:
-            return rule["issue_type"], rule["severity"]
-    return rule_id, "Medium"
-
-
-def build_error(
-    df: pd.DataFrame,
-    mapping: Dict[str, Optional[str]],
-    idx: int,
-    rule_id: str,
-    message: str,
-    value: Any,
-    expected: str,
-    columns: Iterable[str],
-    file_name: str,
-    sheet_name: str,
-) -> ValidationError:
-    issue_type, severity = issue_meta(rule_id)
-    return ValidationError(
-        file_name=file_name,
-        sheet_name=sheet_name,
-        excel_row=int(idx) + 2,
-        report_id=safe_display(col(df, mapping, "report_id").iloc[idx]),
-        ship_name=safe_display(col(df, mapping, "ship_name").iloc[idx]),
-        fleet=safe_display(col(df, mapping, "fleet").iloc[idx]),
-        report_type=safe_display(col(df, mapping, "report_type").iloc[idx]),
-        start_gmt=safe_display(col(df, mapping, "start_gmt").iloc[idx]),
-        end_gmt=safe_display(col(df, mapping, "end_gmt").iloc[idx]),
-        state_name=safe_display(col(df, mapping, "state_name").iloc[idx]),
-        rule_id=rule_id,
-        issue_type=issue_type,
-        severity=severity,
-        message=message,
-        value=safe_display(value),
-        expected=expected,
-        columns=", ".join([c for c in columns if c]),
+def pie_chart(df: pd.DataFrame, category: str, value: str, title: str) -> alt.Chart:
+    base = df[[category, value]].dropna().copy()
+    base = base[base[value] > 0]
+    return (
+        alt.Chart(base)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta(f"{value}:Q"),
+            color=alt.Color(f"{category}:N"),
+            tooltip=[alt.Tooltip(f"{category}:N", title=category), alt.Tooltip(f"{value}:Q", title=value)],
+        )
+        .properties(title=title, height=300)
     )
 
 
-def validate_noon_report(
-    df: pd.DataFrame,
-    file_name: str = "uploaded.xlsx",
-    sheet_name: str = "Table",
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, pd.DataFrame]:
-    cfg = {**DEFAULT_CONFIG, **(config or {})}
-    mapping, missing = map_columns(df)
-    n = len(df)
+def display_error_table(title: str, df: pd.DataFrame) -> None:
+    st.subheader(title)
+    if df.empty:
+        st.success("No validation errors found for this selection.")
+        return
 
-    report_type = col(df, mapping, "report_type").fillna("").astype(str)
-    state_name = col(df, mapping, "state_name").fillna("").astype(str)
-    sea = state_name.str.strip().str.lower().eq("sea passage") | report_type.str.lower().str.contains("sea", na=False)
-
-    start_gmt = to_date(col(df, mapping, "start_gmt"))
-    steaming_time = to_number(col(df, mapping, "steaming_time"))
-    calculated_slip = to_number(col(df, mapping, "calculated_slip"))
-    me_load = to_number(col(df, mapping, "me_load"))
-    total_dg_power = to_number(col(df, mapping, "total_dg_power"))
-    time_since_last = to_number(col(df, mapping, "time_since_last"))
-    dg_hours = {k: to_number(col(df, mapping, k)) for k in ["dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"]}
-    sfoc = to_number(col(df, mapping, "sfoc"))
-    torque_power = to_number(col(df, mapping, "torque_power"))
-    fw_produced = to_number(col(df, mapping, "fw_produced"))
-    fw_consumed = to_number(col(df, mapping, "fw_consumed"))
-    sludge_incinerated_raw = col(df, mapping, "sludge_incinerated")
-    sludge_incinerated = to_number(sludge_incinerated_raw)
-    sludge_produced = to_number(col(df, mapping, "sludge_produced"))
-    total_consumption_24h = to_number(col(df, mapping, "total_consumption_24h"))
-    rob_mgo = to_number(col(df, mapping, "rob_mgo"))
-    reefer_raw = col(df, mapping, "reefer_load")
-    reefer_num = to_number(reefer_raw)
-    difference_pct = to_number(col(df, mapping, "difference_pct"))
-    distance_over_ground = to_number(col(df, mapping, "distance_over_ground"))
-    speed_over_ground = to_number(col(df, mapping, "speed_over_ground"))
-    boiler_cons_24h = to_number(col(df, mapping, "boiler_cons_24h"))
-    dg_cons_24h = to_number(col(df, mapping, "dg_cons_24h"))
-    dg_power = {k: to_number(col(df, mapping, k)) for k in ["dg1_power", "dg2_power", "dg3_power", "dg4_power"]}
-
-    clean_diff = difference_pct[(difference_pct >= cfg["difference_pct_clean_min"]) & (difference_pct <= cfg["difference_pct_clean_max"]) & (difference_pct != 0)]
-    diff_avg = clean_diff.mean() if len(clean_diff) else np.nan
-    diff_count = int(clean_diff.count())
-
-    errors: List[ValidationError] = []
-    multiple_dgs_running_counts = [np.nan] * n
-    multiple_dgs_load_ratio_sums = [np.nan] * n
-    multiple_dgs_limits = [np.nan] * n
-    multiple_dgs_status = [""] * n
-
-    def add(idx: int, rule_id: str, message: str, value: Any, expected: str, column_keys: Iterable[str]) -> None:
-        columns = [mapping.get(k) or k for k in column_keys]
-        errors.append(build_error(df, mapping, idx, rule_id, message, value, expected, columns, file_name, sheet_name))
-
-    max_date = pd.Timestamp(datetime.now().date() + timedelta(days=int(cfg["date_max_days_ahead"])))
-    for i in range(n):
-        # R02 Date
-        raw_date = col(df, mapping, "start_gmt").iloc[i]
-        if pd.isna(start_gmt.iloc[i]) or start_gmt.iloc[i] > max_date:
-            add(i, "R02", "Date", raw_date, f"Valid date <= {max_date.date()}", ["start_gmt"])
-
-        if sea.iloc[i]:
-            # R04 Low Steaming
-            if pd.notna(steaming_time.iloc[i]) and steaming_time.iloc[i] < cfg["low_steaming_hours"]:
-                add(i, "R04", "Low Steaming time", steaming_time.iloc[i], f">= {cfg['low_steaming_hours']} hours", ["steaming_time"])
-
-            # R05 Slip
-            if pd.notna(calculated_slip.iloc[i]) and (calculated_slip.iloc[i] < cfg["slip_min"] or calculated_slip.iloc[i] > cfg["slip_max"]):
-                wind_val = col(df, mapping, "wind_force").iloc[i]
-                suffix = f", Wind Force = {wind_val}" if not is_blank_value(wind_val) else ""
-                add(i, "R05", f"Slip = {fmt_pct(calculated_slip.iloc[i])}{suffix}", calculated_slip.iloc[i], f"{fmt_pct(cfg['slip_min'])} to {fmt_pct(cfg['slip_max'])}", ["calculated_slip", "wind_force"])
-
-            # R06 MCR/ME Load
-            if pd.notna(me_load.iloc[i]) and (me_load.iloc[i] < cfg["me_load_min"] or me_load.iloc[i] > cfg["me_load_max"]):
-                add(i, "R06", f"MCR = {fmt_pct(me_load.iloc[i])}", me_load.iloc[i], f"{fmt_pct(cfg['me_load_min'])} to {fmt_pct(cfg['me_load_max'])}", ["me_load"])
-
-            # R11 SFOC
-            if pd.notna(sfoc.iloc[i]) and sfoc.iloc[i] != 0 and (sfoc.iloc[i] < cfg["sfoc_min"] or sfoc.iloc[i] > cfg["sfoc_max"]):
-                add(i, "R11", f"SFOC = {fmt_num(sfoc.iloc[i], 1)}", sfoc.iloc[i], f"{cfg['sfoc_min']} to {cfg['sfoc_max']}", ["sfoc"])
-
-            # R12 Torque
-            if pd.notna(torque_power.iloc[i]) and torque_power.iloc[i] != 0 and (torque_power.iloc[i] < cfg["torque_power_min_kw"] or torque_power.iloc[i] > cfg["torque_power_max_kw"]):
-                add(i, "R12", f"Torque = {fmt_num(torque_power.iloc[i], 0)}", torque_power.iloc[i], f"{cfg['torque_power_min_kw']} to {cfg['torque_power_max_kw']} kW", ["torque_power"])
-
-            # R13 Low FW Production
-            if pd.notna(fw_produced.iloc[i]) and pd.notna(steaming_time.iloc[i]) and fw_produced.iloc[i] < cfg["fw_produced_min_cbm"] and steaming_time.iloc[i] > cfg["low_fw_steaming_hours"]:
-                add(i, "R13", "Low FW production", fw_produced.iloc[i], f">= {cfg['fw_produced_min_cbm']} cbm when steaming > {cfg['low_fw_steaming_hours']} h", ["fw_produced", "steaming_time"])
-
-            # R14 High FW Consumption
-            if pd.notna(fw_consumed.iloc[i]) and fw_consumed.iloc[i] > cfg["fw_consumed_max_cbm"]:
-                add(i, "R14", "High FW Consumption", fw_consumed.iloc[i], f"<= {cfg['fw_consumed_max_cbm']} cbm", ["fw_consumed"])
-
-            # R15 Sludge Incinerated
-            raw_sludge_inc = sludge_incinerated_raw.iloc[i]
-            if is_blank_value(raw_sludge_inc) or (pd.notna(sludge_incinerated.iloc[i]) and sludge_incinerated.iloc[i] == 0):
-                add(i, "R15", "Sludge Incinerated = 0", raw_sludge_inc, "> 0 for sea rows", ["sludge_incinerated"])
-
-            # R16 Excessive Sludge
-            if pd.notna(sludge_produced.iloc[i]) and pd.notna(total_consumption_24h.iloc[i]) and sludge_produced.iloc[i] > cfg["sludge_factor_of_total_consumption"] * total_consumption_24h.iloc[i]:
-                add(i, "R16", "Excessive Sludge", sludge_produced.iloc[i], f"<= {cfg['sludge_factor_of_total_consumption']:.3f} * Total Consumption 24H", ["sludge_produced", "total_consumption_24h"])
-
-            # R21 Consumption % Outlier
-            if diff_count >= cfg["difference_pct_min_count"] and pd.notna(difference_pct.iloc[i]) and difference_pct.iloc[i] != 0:
-                if difference_pct.iloc[i] < diff_avg - cfg["difference_pct_avg_band"] or difference_pct.iloc[i] > diff_avg + cfg["difference_pct_avg_band"]:
-                    add(i, "R21", f"Consumption = {fmt_pct(difference_pct.iloc[i])}, Average = {fmt_pct(diff_avg)}", difference_pct.iloc[i], f"Average +/- {fmt_pct(cfg['difference_pct_avg_band'])}", ["difference_pct"])
-
-            # R22 Distance vs Speed*Time
-            expected_distance = steaming_time.iloc[i] * speed_over_ground.iloc[i]
-            if pd.notna(distance_over_ground.iloc[i]) and pd.notna(steaming_time.iloc[i]) and pd.notna(speed_over_ground.iloc[i]) and expected_distance != 0:
-                low = expected_distance * (1 - cfg["distance_tolerance_pct"])
-                high = expected_distance * (1 + cfg["distance_tolerance_pct"])
-                if distance_over_ground.iloc[i] < low or distance_over_ground.iloc[i] > high:
-                    add(i, "R22", "St.Time*Speed =/= Distance", distance_over_ground.iloc[i], f"{low:.2f} to {high:.2f} nm", ["distance_over_ground", "steaming_time", "speed_over_ground"])
-
-            # R24C DG Cons <1
-            if pd.notna(dg_cons_24h.iloc[i]) and dg_cons_24h.iloc[i] < cfg["dg_cons_low_mt"]:
-                add(i, "R24C", "DG Cons < 1", dg_cons_24h.iloc[i], f">= {cfg['dg_cons_low_mt']} MT", ["dg_cons_24h"])
-
-        # R07 Electric Load (all report types)
-        if pd.notna(total_dg_power.iloc[i]) and (total_dg_power.iloc[i] < cfg["electric_load_min_kw"] or total_dg_power.iloc[i] > cfg["electric_load_max_kw"]):
-            add(i, "R07", f"Electric Load = {fmt_num(total_dg_power.iloc[i], 0)}", total_dg_power.iloc[i], f"{cfg['electric_load_min_kw']} to {cfg['electric_load_max_kw']} kW", ["total_dg_power"])
-
-        # R10 DG Hours
-        if pd.notna(time_since_last.iloc[i]):
-            over = []
-            for key, series in dg_hours.items():
-                if pd.notna(series.iloc[i]) and series.iloc[i] > time_since_last.iloc[i]:
-                    over.append(mapping.get(key) or key)
-            if over:
-                add(i, "R10", "a DG's Hours is more then Time since last reporting", "; ".join(over), f"Each DG running hours <= {time_since_last.iloc[i]}", ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"])
-
-        # R25 Multiple DGs
-        # Formula requested:
-        # sum(DG_POWER / DG_MCR) < load_factor * (running_dg_count - 1)
-        # where a DG is treated as running when DG_POWER > running_threshold_kw.
-        vessel_name_for_mcr = col(df, mapping, "ship_name").iloc[i]
-        vessel_mcr = get_vessel_fixed_mcr(vessel_name_for_mcr)
-        if vessel_mcr and vessel_mcr.get("dg_mcr"):
-            running_threshold_kw = float(cfg.get("dg_power_running_threshold_kw", 10.0))
-            load_factor = float(cfg.get("dg_optimization_load_factor", 0.70))
-            dg_mcr_values = vessel_mcr["dg_mcr"]
-            dg_power_values = [dg_power[key].iloc[i] for key in ["dg1_power", "dg2_power", "dg3_power", "dg4_power"]]
-
-            running_count = 0
-            load_ratio_sum = 0.0
-            display_terms = []
-            missing_mcr_for_running = []
-            any_power_available = False
-
-            for pos, (power_value, mcr_value) in enumerate(zip(dg_power_values, dg_mcr_values), start=1):
-                if pd.isna(power_value):
-                    power_kw = 0.0
-                else:
-                    any_power_available = True
-                    power_kw = float(power_value)
-
-                is_running = power_kw > running_threshold_kw
-                if is_running:
-                    running_count += 1
-
-                running_label = "counted running" if is_running else "not counted"
-                if is_valid_positive_number(mcr_value):
-                    mcr_kw = float(mcr_value)
-                    # Keep the left side exactly as requested: all DG power values
-                    # are included in the sum, while the threshold only controls
-                    # the running-DG count on the right side.
-                    load_ratio = power_kw / mcr_kw
-                    load_ratio_sum += load_ratio
-                    display_terms.append(
-                        f"DG{pos}: {fmt_num(power_kw, 0)}/{fmt_num(mcr_kw, 0)} kW ({fmt_pct(load_ratio)}, {running_label})"
-                    )
-                elif is_running:
-                    missing_mcr_for_running.append(f"DG{pos}")
-                else:
-                    display_terms.append(f"DG{pos}: {fmt_num(power_kw, 0)} kW ({running_label}, MCR not set)")
-
-            if any_power_available:
-                threshold = load_factor * max(running_count - 1, 0)
-                multiple_dgs_running_counts[i] = running_count
-                multiple_dgs_load_ratio_sums[i] = load_ratio_sum
-                multiple_dgs_limits[i] = threshold
-                multiple_dgs_status[i] = (
-                    f"DG threshold > {fmt_num(running_threshold_kw, 0)} kW; "
-                    f"running DGs = {running_count}; relative load = {fmt_pct(load_ratio_sum)}; "
-                    f"limit = {fmt_pct(threshold)}"
-                )
-
-            if any_power_available and running_count > 1 and not missing_mcr_for_running:
-                threshold = load_factor * (running_count - 1)
-                if load_ratio_sum < threshold:
-                    add(
-                        i,
-                        "R25",
-                        f"Multiple DGs check: {running_count} DGs counted running above {fmt_num(running_threshold_kw, 0)} kW; combined relative load = {fmt_pct(load_ratio_sum)}",
-                        "; ".join(display_terms),
-                        f">= {fmt_pct(threshold)} based on {fmt_num(load_factor, 2)} * ({running_count} - 1). A DG is counted running only when DG power > {fmt_num(running_threshold_kw, 0)} kW; consider if fewer DGs can cover the required load",
-                        ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
-                    )
-        else:
-            multiple_dgs_status[i] = f"No fixed AE/DG MCR found for vessel: {safe_display(vessel_name_for_mcr)}"
-
-        # R18 Low MGO ROB
-        if pd.notna(rob_mgo.iloc[i]) and rob_mgo.iloc[i] < cfg["mgo_rob_min_mt"]:
-            add(i, "R18", "Low MGO ROB", rob_mgo.iloc[i], f">= {cfg['mgo_rob_min_mt']} MT", ["rob_mgo"])
-
-        # R20 Reefer Load
-        raw_reefer = reefer_raw.iloc[i]
-        if not is_blank_value(raw_reefer) and pd.isna(reefer_num.iloc[i]):
-            add(i, "R20", "Error in Reefer Load", raw_reefer, "Numeric when present", ["reefer_load"])
-
-        # R23 Boiler Cons
-        if pd.notna(boiler_cons_24h.iloc[i]) and boiler_cons_24h.iloc[i] > cfg["boiler_cons_max_mt"]:
-            add(i, "R23", "Boiler Cons > 5", boiler_cons_24h.iloc[i], f"<= {cfg['boiler_cons_max_mt']} MT", ["boiler_cons_24h"])
-
-        # R24A DG Cons >13
-        if pd.notna(dg_cons_24h.iloc[i]) and dg_cons_24h.iloc[i] > cfg["dg_cons_high_mt"]:
-            add(i, "R24A", "DG Cons > 13", dg_cons_24h.iloc[i], f"<= {cfg['dg_cons_high_mt']} MT", ["dg_cons_24h"])
-
-        # R24B High DG Cons vs Load
-        if pd.notna(dg_cons_24h.iloc[i]) and pd.notna(total_dg_power.iloc[i]):
-            expected_dg_cons = cfg["dg_sfc_g_per_kwh"] * 24 * total_dg_power.iloc[i] / 1_000_000
-            if dg_cons_24h.iloc[i] - expected_dg_cons > cfg["dg_cons_vs_load_buffer_mt"]:
-                add(i, "R24B", "High DG Cons", dg_cons_24h.iloc[i], f"<= load-based expected + {cfg['dg_cons_vs_load_buffer_mt']} MT ({expected_dg_cons + cfg['dg_cons_vs_load_buffer_mt']:.2f})", ["dg_cons_24h", "total_dg_power"])
-
-    errors_df = pd.DataFrame([asdict(e) for e in errors])
-    if errors_df.empty:
-        errors_df = pd.DataFrame(columns=list(ValidationError.__annotations__.keys()))
-
-    # Wide row-level checker, similar to the Excel checker workbook.
-    base_cols = {
-        "file_name": file_name,
-        "sheet_name": sheet_name,
-        "excel_row": np.arange(2, n + 2),
-        "report_id": col(df, mapping, "report_id"),
-        "ship_name": col(df, mapping, "ship_name"),
-        "fleet": col(df, mapping, "fleet"),
-        "report_type": col(df, mapping, "report_type"),
-        "start_gmt": col(df, mapping, "start_gmt"),
-        "end_gmt": col(df, mapping, "end_gmt"),
-        "state_name": col(df, mapping, "state_name"),
-        "scope": np.where(sea, "Sea", "Not sea"),
-        "multiple_dgs_running_count": multiple_dgs_running_counts,
-        "multiple_dgs_load_ratio_sum": multiple_dgs_load_ratio_sums,
-        "multiple_dgs_limit": multiple_dgs_limits,
-        "multiple_dgs_status": multiple_dgs_status,
-    }
-    checked_rows = pd.DataFrame(base_cols)
-    for rule in RULES:
-        checked_rows[rule["issue_type"]] = ""
-    for _, e in errors_df.iterrows():
-        mask = checked_rows["excel_row"] == e["excel_row"]
-        if e["issue_type"] in checked_rows.columns:
-            checked_rows.loc[mask, e["issue_type"]] = checked_rows.loc[mask, e["issue_type"]].astype(str).where(
-                checked_rows.loc[mask, e["issue_type"]].astype(str).eq(""),
-                checked_rows.loc[mask, e["issue_type"]].astype(str) + " | "
-            ) + str(e["message"])
-    issue_cols = [r["issue_type"] for r in RULES]
-    checked_rows["issue_count"] = checked_rows[issue_cols].ne("").sum(axis=1)
-    checked_rows["combined_issues"] = checked_rows[issue_cols].apply(lambda row: "OK" if all(v == "" for v in row) else " & ".join([str(v) for v in row if v != ""]), axis=1)
-    checked_rows["notes"] = np.where(checked_rows["scope"].eq("Sea"), "", "Not sea passage / sea-only checks skipped")
-
-    skipped_rule_rows = []
-    required_by_rule = {
-        "R02": ["start_gmt"],
-        "R04": ["report_type", "state_name", "steaming_time"],
-        "R05": ["report_type", "state_name", "calculated_slip"],
-        "R06": ["report_type", "state_name", "me_load"],
-        "R07": ["total_dg_power"],
-        "R10": ["time_since_last", "dg1_hours", "dg2_hours", "dg3_hours", "dg4_hours"],
-        "R11": ["report_type", "state_name", "sfoc"],
-        "R12": ["report_type", "state_name", "torque_power"],
-        "R13": ["report_type", "state_name", "fw_produced", "steaming_time"],
-        "R14": ["report_type", "state_name", "fw_consumed"],
-        "R15": ["report_type", "state_name", "sludge_incinerated"],
-        "R16": ["report_type", "state_name", "sludge_produced", "total_consumption_24h"],
-        "R18": ["rob_mgo"],
-        "R20": ["reefer_load"],
-        "R21": ["report_type", "state_name", "difference_pct"],
-        "R22": ["report_type", "state_name", "distance_over_ground", "steaming_time", "speed_over_ground"],
-        "R23": ["boiler_cons_24h"],
-        "R24A": ["dg_cons_24h"],
-        "R24B": ["dg_cons_24h", "total_dg_power"],
-        "R24C": ["report_type", "state_name", "dg_cons_24h"],
-        "R25": ["ship_name", "dg1_power", "dg2_power", "dg3_power", "dg4_power"],
-    }
-    for rule in RULES:
-        missing_cols = [k for k in required_by_rule.get(rule["rule_id"], []) if mapping.get(k) is None]
-        if missing_cols:
-            skipped_rule_rows.append({
-                "file_name": file_name,
-                "sheet_name": sheet_name,
-                "rule_id": rule["rule_id"],
-                "issue_type": rule["issue_type"],
-                "missing_column_keys": ", ".join(missing_cols),
-                "expected_aliases": "; ".join([f"{k}: {COLUMN_ALIASES.get(k, [])}" for k in missing_cols]),
-            })
-    skipped_rules_df = pd.DataFrame(skipped_rule_rows)
-
-    summary_rows = [
-        {"metric": "File", "value": file_name},
-        {"metric": "Sheet", "value": sheet_name},
-        {"metric": "Report rows", "value": n},
-        {"metric": "Rows with issues", "value": int((checked_rows["issue_count"] > 0).sum())},
-        {"metric": "Rows OK", "value": int((checked_rows["issue_count"] == 0).sum())},
-        {"metric": "Total issues", "value": int(len(errors_df))},
-        {"metric": "Average Difference Percentage basis", "value": diff_avg},
-        {"metric": "Count Difference Percentage basis", "value": diff_count},
-        {"metric": "Skipped rules due to missing columns", "value": len(skipped_rules_df)},
+    preferred_cols = [
+        "report_date",
+        "file_name",
+        "report_id",
+        "ship_name",
+        "fleet",
+        "report_type",
+        "state_name",
+        "issue_type",
+        "severity",
+        "message",
+        "value",
+        "expected",
+        "columns",
     ]
-    summary = pd.DataFrame(summary_rows)
-    by_rule = errors_df.groupby(["rule_id", "issue_type", "severity"], dropna=False).size().reset_index(name="count") if not errors_df.empty else pd.DataFrame(columns=["rule_id", "issue_type", "severity", "count"])
-
-    rules_df = pd.DataFrame(RULES)
-    columns_df = pd.DataFrame([{"column_key": k, "matched_column": v or "", "aliases": ", ".join(COLUMN_ALIASES.get(k, []))} for k, v in mapping.items()])
-
-    return {
-        "summary": summary,
-        "by_rule": by_rule,
-        "errors": errors_df,
-        "checked_rows": checked_rows,
-        "skipped_rules": skipped_rules_df,
-        "rules": rules_df,
-        "columns": columns_df,
-    }
+    cols = [c for c in preferred_cols if c in df.columns]
+    sort_cols = [c for c in ["report_date", "severity", "issue_type"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False, True, True][: len(sort_cols)])
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
 
-def validate_excel_file(file_obj: Any, file_name: str = "uploaded.xlsx", sheet_name: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> Dict[str, pd.DataFrame]:
-    df, selected_sheet = read_noon_excel(file_obj, file_name=file_name, sheet_name=sheet_name)
-    return validate_noon_report(df, file_name=file_name, sheet_name=selected_sheet, config=config)
+# -----------------------------------------------------------------------------
+# Copy-paste message template helpers
+# -----------------------------------------------------------------------------
+
+def clean_message_value(value: object, default: str = "-") -> str:
+    """Return a compact, readable string for message templates."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text if text else default
 
 
-def combine_results(results: List[Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
-    keys = ["summary", "by_rule", "errors", "checked_rows", "skipped_rules", "rules", "columns"]
-    combined: Dict[str, pd.DataFrame] = {}
+def format_template_report_date(value: object) -> str:
+    """Format a report date for operational messages."""
+    if value is None:
+        return "-"
+    try:
+        if pd.isna(value):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    try:
+        return format_report_date(value)
+    except Exception:  # noqa: BLE001 - keep message generation robust
+        return clean_message_value(value)
+
+
+def get_template_date_label(errors_df: pd.DataFrame, checked_rows_df: pd.DataFrame) -> str:
+    """Build a date label from the currently selected validation scope."""
+    dates = []
+    for df in (errors_df, checked_rows_df):
+        if not df.empty and "report_date" in df.columns:
+            dates.extend(df["report_date"].dropna().tolist())
+    if not dates:
+        return "selected report window"
+    unique_dates = sorted(set(dates))
+    if len(unique_dates) == 1:
+        return format_template_report_date(unique_dates[0])
+    return f"{format_template_report_date(unique_dates[0])} - {format_template_report_date(unique_dates[-1])}"
+
+
+def build_issue_lines(errors_df: pd.DataFrame) -> str:
+    """Create bullet lines for all validation findings in the current filtered scope."""
+    if errors_df.empty:
+        return "- No validation errors found for this selection."
+
+    sort_cols = [c for c in ["report_date", "severity", "ship_name", "issue_type"] if c in errors_df.columns]
+    view = errors_df.copy()
+    if sort_cols:
+        ascending = [False if c == "report_date" else True for c in sort_cols]
+        view = view.sort_values(sort_cols, ascending=ascending)
+
+    lines = []
+    for _, row in view.iterrows():
+        parts = []
+        if "report_date" in view.columns:
+            parts.append(format_template_report_date(row.get("report_date")))
+        if "ship_name" in view.columns:
+            parts.append(clean_message_value(row.get("ship_name")))
+        if "report_type" in view.columns:
+            parts.append(clean_message_value(row.get("report_type")))
+        issue = clean_message_value(row.get("issue_type"))
+        message = clean_message_value(row.get("message"), "")
+        value = clean_message_value(row.get("value"), "")
+        expected = clean_message_value(row.get("expected"), "")
+
+        detail = issue
+        if message:
+            detail += f": {message}"
+        if value and expected:
+            detail += f" | Value: {value} | Expected: {expected}"
+        elif value:
+            detail += f" | Value: {value}"
+        elif expected:
+            detail += f" | Expected: {expected}"
+
+        prefix = " | ".join(p for p in parts if p and p != "-")
+        lines.append(f"- {prefix} | {detail}" if prefix else f"- {detail}")
+
+    return "\n".join(lines)
+
+
+def build_rule_summary_lines(by_rule_df: pd.DataFrame, max_items: int = 8) -> str:
+    """Create a compact top-rule summary for message templates."""
+    if by_rule_df.empty or not {"issue_type", "count"}.issubset(by_rule_df.columns):
+        return "- No error categories found."
+    view = by_rule_df.sort_values("count", ascending=False).head(int(max_items))
+    return "\n".join(f"- {row.issue_type}: {int(row.count)}" for row in view.itertuples(index=False))
+
+
+def build_vessel_attention_lines(vessel_summary_df: pd.DataFrame, max_items: int = 8) -> str:
+    """Summarize vessels requiring attention for fleet-level messages."""
+    needed = {"Vessel", "total_errors", "high_severity_errors"}
+    if vessel_summary_df.empty or not needed.issubset(vessel_summary_df.columns):
+        return "- No vessel summary available for this selection."
+    view = vessel_summary_df.sort_values(["high_severity_errors", "total_errors"], ascending=[False, False]).head(int(max_items))
+    lines = []
+    for row in view.itertuples(index=False):
+        if int(row.total_errors) <= 0:
+            continue
+        lines.append(f"- {row.Vessel}: {int(row.total_errors)} issue(s), {int(row.high_severity_errors)} high severity")
+    return "\n".join(lines) if lines else "- No vessels with validation issues in this selection."
+
+
+def build_message_template(
+    template_name: str,
+    errors_df: pd.DataFrame,
+    checked_rows_df: pd.DataFrame,
+    by_rule_df: pd.DataFrame,
+    vessel_summary_df: pd.DataFrame,
+    selected_vessel_name: str,
+    data_window_text: str,
+
+) -> str:
+    """Generate a copy-ready operational message from the current app selection."""
+    vessel_label = selected_vessel_name if selected_vessel_name != "All vessels" else "fleet / current selection"
+    date_label = get_template_date_label(errors_df, checked_rows_df)
+    total_rows = len(checked_rows_df)
+    rows_with_issues = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) > 0).sum()) if total_rows else 0
+    total_issues = len(errors_df)
+    high_issues = int(errors_df["severity"].astype(str).eq("High").sum()) if not errors_df.empty and "severity" in errors_df.columns else 0
+    issue_lines = build_issue_lines(errors_df)
+    rule_lines = build_rule_summary_lines(by_rule_df)
+    vessel_lines = build_vessel_attention_lines(vessel_summary_df)
+
+    if total_issues == 0:
+        no_issue_body = (
+            f"Noon report validation completed for {vessel_label}.\n\n"
+            f"Report window: {date_label}\n"
+            f"{data_window_text}\n"
+            f"Checked rows: {total_rows}\n\n"
+            "No validation issues were found for the current selection."
+        )
+        if template_name == "Vessel follow-up email":
+            return (
+                f"Subject: Noon report validation - {vessel_label} - {date_label}\n\n"
+                "Good day Captain,\n\n"
+                f"{no_issue_body}\n\n"
+                "No action is required from your side at this stage.\n\n"
+                "Best regards,"
+            )
+        return no_issue_body
+
+    if template_name == "Vessel follow-up email":
+        return (
+            f"Subject: Noon report validation follow-up - {vessel_label} - {date_label}\n\n"
+            "Good day Captain,\n\n"
+            f"Please review the below noon report validation findings for {vessel_label}.\n\n"
+            "Summary:\n"
+            f"- Report window: {date_label}\n"
+            f"- {data_window_text}\n"
+            f"- Checked rows: {total_rows}\n"
+            f"- Rows with issues: {rows_with_issues}\n"
+            f"- Total issues: {total_issues}\n"
+            f"- High severity issues: {high_issues}\n\n"
+            "Main findings:\n"
+            f"{issue_lines}\n\n"
+            "Kindly check the highlighted items in the exported Excel report and revert with confirmation/corrections where required.\n\n"
+            "Best regards,"
+        )
+
+    if template_name == "Internal fleet summary":
+        return (
+            "Team,\n\n"
+            f"Noon report validation has been completed for {vessel_label}.\n\n"
+            "Summary:\n"
+            f"- Report window: {date_label}\n"
+            f"- {data_window_text}\n"
+            f"- Checked rows: {total_rows}\n"
+            f"- Rows with issues: {rows_with_issues}\n"
+            f"- Total issues: {total_issues}\n"
+            f"- High severity issues: {high_issues}\n\n"
+            "Top error categories:\n"
+            f"{rule_lines}\n\n"
+            "Vessels requiring attention:\n"
+            f"{vessel_lines}\n\n"
+            "Detailed findings are available in the exported Excel validation report."
+        )
+
+    return (
+        f"Noon checker completed for {vessel_label} ({date_label}). "
+        f"Found {total_issues} issue(s) across {rows_with_issues} row(s); high severity: {high_issues}.\n\n"
+        "Main items:\n"
+        f"{issue_lines}\n\n"
+        "Please review the exported Excel report and update/correct the relevant noon report entries."
+    )
+
+
+def build_message_templates_df(
+    errors_df: pd.DataFrame,
+    checked_rows_df: pd.DataFrame,
+    by_rule_df: pd.DataFrame,
+    vessel_summary_df: pd.DataFrame,
+    selected_vessel_name: str,
+    data_window_text: str,
+
+) -> pd.DataFrame:
+    """Return all standard templates as a dataframe, ready for optional Excel export."""
+    template_names = ["Vessel follow-up email", "Internal fleet summary", "Short Teams/WhatsApp message"]
+    rows = []
+    for template_name in template_names:
+        rows.append(
+            {
+                "template_name": template_name,
+                "vessel_scope": selected_vessel_name,
+                "message": build_message_template(
+                    template_name,
+                    errors_df,
+                    checked_rows_df,
+                    by_rule_df,
+                    vessel_summary_df,
+                    selected_vessel_name,
+                    data_window_text,
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+
+def build_issue_follow_up_message(issue_row: pd.Series | dict) -> str:
+    """Build one copy-paste message for one validation issue row."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    return (
+        "Dear Captain / Chief Engineer,\n\n"
+        "Please note that a validation check has identified a possible inconsistency in the submitted report.\n\n"
+        f"Issue: {clean_message_value(get_value('issue_type'))}\n"
+        f"Reported value: {clean_message_value(get_value('value'))}\n"
+        f"Expected / normal range: {clean_message_value(get_value('expected'))}\n"
+        f"Related field(s): {clean_message_value(get_value('columns'))}\n\n"
+        "Kindly verify the reported value and amend the report if required. "
+        "If the value is confirmed correct, please provide a short comment/justification in the remarks.\n\n"
+        "Best Regards,"
+    )
+
+
+def build_issue_message_subject(issue_row: pd.Series | dict, selected_vessel_name: str = "") -> str:
+    """Build a concise email subject for the selected validation issue."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    vessel = clean_message_value(get_value("ship_name"), selected_vessel_name or "Vessel")
+    issue = clean_message_value(get_value("issue_type"), "Validation issue")
+    report_date = format_template_report_date(get_value("report_date"))
+    date_suffix = f" - {report_date}" if report_date and report_date != "-" else ""
+    return f"Noon report validation check - {vessel}{date_suffix} - {issue}"
+
+
+def add_copy_paste_issue_messages(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Add one copy-paste message column per validation issue for Excel/CSV export."""
+    out = errors_df.copy()
+    if out.empty:
+        out["email_subject"] = pd.Series(dtype="object")
+        out["copy_paste_message"] = pd.Series(dtype="object")
+        return out
+    out["email_subject"] = out.apply(lambda row: build_issue_message_subject(row, selected_vessel_name), axis=1)
+    out["copy_paste_message"] = out.apply(build_issue_follow_up_message, axis=1)
+    return out
+
+
+def build_issue_messages_df(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Return a dedicated dataframe containing one generated message per validation issue."""
+    if errors_df.empty:
+        return pd.DataFrame(columns=["message_no", "ship_name", "report_date", "issue_type", "email_subject", "copy_paste_message"])
+    export_df = add_copy_paste_issue_messages(errors_df, selected_vessel_name).reset_index(drop=True)
+    export_df.insert(0, "message_no", range(1, len(export_df) + 1))
+    preferred = [
+        "message_no",
+        "ship_name",
+        "report_date",
+        "report_type",
+        "excel_row",
+        "report_id",
+        "issue_type",
+        "severity",
+        "value",
+        "expected",
+        "columns",
+        "email_subject",
+        "copy_paste_message",
+    ]
+    return export_df[[col for col in preferred if col in export_df.columns]]
+
+
+def build_issue_selector_options(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> list[tuple[str, int]]:
+    """Build readable selectbox labels for validation issues."""
+    if errors_df.empty:
+        return []
+    view = errors_df.reset_index(drop=True)
+    options = []
+    for idx, row in view.iterrows():
+        date_text = format_template_report_date(row.get("report_date")) if "report_date" in view.columns else "-"
+        vessel = clean_message_value(row.get("ship_name"), selected_vessel_name or "-")
+        issue = clean_message_value(row.get("issue_type"), "Validation issue")
+        label_parts = [f"#{idx + 1}", vessel, date_text, issue]
+        options.append((" | ".join(part for part in label_parts if part and part != "-"), idx))
+    return options
+
+
+def build_all_issue_messages_text(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build a combined text containing one message for every issue in the current filtered scope."""
+    if errors_df.empty:
+        return "No validation issues were found for the current selection."
+    view = errors_df.reset_index(drop=True)
+    messages = []
+    for idx, row in view.iterrows():
+        subject = build_issue_message_subject(row, selected_vessel_name)
+        messages.append(f"MESSAGE {idx + 1}\nSubject: {subject}\n\n{build_issue_follow_up_message(row)}")
+    return "\n\n---\n\n".join(messages)
+
+
+def build_captain_chief_engineer_subject(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build one email subject for the current filtered validation scope."""
+    vessel_label = selected_vessel_name if selected_vessel_name and selected_vessel_name != "All vessels" else "Current selection"
+    date_label = get_template_date_label(errors_df, pd.DataFrame())
+    date_suffix = f" - {date_label}" if date_label and date_label != "selected report window" else ""
+    return f"Noon report validation check - {vessel_label}{date_suffix}"
+
+
+def build_issue_detail_block(issue_row: pd.Series | dict, issue_no: int | None = None) -> str:
+    """Build one issue block inside the Captain / Chief Engineer message."""
+    get_value = issue_row.get if hasattr(issue_row, "get") else lambda key, default=None: default
+    title = f"Issue {issue_no}" if issue_no is not None else "Issue"
+
+    context_lines = []
+    report_date = format_template_report_date(get_value("report_date"))
+    if report_date and report_date != "-":
+        context_lines.append(f"Report date: {report_date}")
+
+    for label, key in [
+        ("Vessel", "ship_name"),
+        ("Report type", "report_type"),
+        ("Report ID", "report_id"),
+    ]:
+        value = clean_message_value(get_value(key), "")
+        if value:
+            context_lines.append(f"{label}: {value}")
+
+    lines = [f"{title}:"]
+    if context_lines:
+        lines.extend(context_lines)
+    lines.extend(
+        [
+            f"Issue: {clean_message_value(get_value('issue_type'))}",
+            f"Reported value: {clean_message_value(get_value('value'))}",
+            f"Expected / normal range: {clean_message_value(get_value('expected'))}",
+            f"Related field(s): {clean_message_value(get_value('columns'))}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_captain_chief_engineer_message(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> str:
+    """Build the single copy-paste message for Captain / Chief Engineer using current filters."""
+    if errors_df.empty:
+        return (
+            "Dear Captain / Chief Engineer,\n\n"
+            "Please note that the validation check has been completed for the current selection.\n\n"
+            "No possible inconsistencies were identified in the submitted report(s).\n\n"
+            "Best Regards,"
+        )
+
+    view = errors_df.copy().reset_index(drop=True)
+    sort_cols = [c for c in ["report_date", "ship_name", "report_type", "issue_type"] if c in view.columns]
+    if sort_cols:
+        ascending = [False if c == "report_date" else True for c in sort_cols]
+        view = view.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    issue_blocks = [build_issue_detail_block(row, idx + 1) for idx, row in view.iterrows()]
+    inconsistency_word = "a possible inconsistency" if len(view) == 1 else "possible inconsistencies"
+
+    return (
+        "Dear Captain / Chief Engineer,\n\n"
+        f"Please note that a validation check has identified {inconsistency_word} in the submitted report.\n\n"
+        + "\n\n".join(issue_blocks)
+        + "\n\n"
+        "Kindly verify the reported value(s) and amend the report if required. "
+        "If the value(s) are confirmed correct, please provide a short comment/justification in the remarks.\n\n"
+        "Best Regards,"
+    )
+
+
+def build_captain_message_df(errors_df: pd.DataFrame, selected_vessel_name: str = "") -> pd.DataFrame:
+    """Return one-row dataframe containing the current Captain / Chief Engineer message."""
+    return pd.DataFrame(
+        [
+            {
+                "email_subject": build_captain_chief_engineer_subject(errors_df, selected_vessel_name),
+                "copy_paste_message": build_captain_chief_engineer_message(errors_df, selected_vessel_name),
+                "issue_count": len(errors_df),
+                "vessel_scope": selected_vessel_name,
+            }
+        ]
+    )
+
+
+# -----------------------------------------------------------------------------
+# Department auto-source helpers
+# -----------------------------------------------------------------------------
+
+class MemoryUploadedFile:
+    """Small uploaded-file-like wrapper so the existing validator can read auto-source bytes."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def make_sharepoint_download_url(url: str) -> str:
+    """Convert a SharePoint/OneDrive web-view URL into a best-effort download URL."""
+    parts = urlsplit(url.strip())
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("web", None)
+    query["download"] = "1"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_auto_source_file(source_url: str, refresh_token: int = 0) -> bytes:
+    """Download the department Excel source. refresh_token is used to force cache refresh."""
+    del refresh_token
+
+    if not source_url or not source_url.strip():
+        raise ValueError("AUTO_SOURCE_URL is missing from Streamlit secrets.")
+
+    download_url = make_sharepoint_download_url(source_url)
+    response = requests.get(
+        download_url,
+        timeout=90,
+        allow_redirects=True,
+        headers={
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    response.raise_for_status()
+
+    content = response.content
+    content_type = response.headers.get("Content-Type", "")
+
+    # xlsx/xlsm files are ZIP containers and normally start with PK.
+    # If SharePoint returns a login page/HTML, validation would fail later with a cryptic error.
+    if not content.startswith(b"PK"):
+        preview = content[:160].decode("utf-8", errors="ignore").replace("\n", " ").strip()
+        raise ValueError(
+            "The auto source did not return a downloadable Excel file. "
+            "It may require SharePoint login, or the link is not a direct/anonymous download link. "
+            f"Content-Type: {content_type}. Preview: {preview}"
+        )
+
+    return content
+
+
+# -----------------------------------------------------------------------------
+# Validation cache / dashboard rule-filter helpers
+# -----------------------------------------------------------------------------
+
+def build_source_signature(uploaded_files: list) -> tuple:
+    """Create a robust signature so filters do not trigger revalidation, but source changes do."""
+    signature = []
+    for uploaded in uploaded_files:
+        payload = uploaded.getvalue()
+        payload_hash = hashlib.md5(payload).hexdigest()
+        signature.append((uploaded.name, len(payload), payload_hash))
+    return tuple(signature)
+
+
+def build_config_signature(config: dict) -> tuple:
+    """Validation thresholds signature. Display filters are intentionally excluded."""
+    return tuple(sorted(config.items()))
+
+
+def get_rule_name(rule: object) -> str:
+    """Extract a stable display name from RULES entries."""
+    if isinstance(rule, dict):
+        for key in ("issue_type", "rule", "name", "id", "Rule", "Rule Name"):
+            value = rule.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+    return str(rule)
+
+
+def get_rule_options() -> list[str]:
+    return sorted(set(get_rule_name(rule) for rule in RULES if str(get_rule_name(rule)).strip()))
+
+
+def rules_by_keywords(rule_options: list[str], keywords: list[str]) -> list[str]:
+    out = []
+    for rule in rule_options:
+        text = rule.lower()
+        if any(keyword in text for keyword in keywords):
+            out.append(rule)
+    return out
+
+
+def normalize_merge_key_value(value: object) -> str:
+    """Normalize merge-key values so app filtering is stable across mixed Excel dtypes."""
+    try:
+        if pd.isna(value):
+            return "__MISSING__"
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value).strip()
+
+
+def rebuild_checked_rows_issue_counts(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
+    """Recalculate issue_count after validation rule scope is applied.
+
+    The checked rows and errors tables can contain the same key with different
+    pandas dtypes, depending on how Excel interpreted the source values.
+    For example, report_id or excel_row may be numeric in one table and object
+    in another. Normalize temporary merge keys to strings before merging to
+    avoid pandas dtype mismatch errors.
+    """
+    out = checked_rows_df.copy()
+    if out.empty:
+        return out
+
+    keys = [c for c in ["file_name", "excel_row", "report_id", "ship_name"] if c in out.columns and c in errors_df.columns]
+    if "raw_issue_count" not in out.columns and "issue_count" in out.columns:
+        out["raw_issue_count"] = out["issue_count"]
+
+    if not keys or errors_df.empty:
+        out["issue_count"] = 0
+        return out
+
+    errors_for_count = errors_df.copy()
+    merge_keys = []
     for key in keys:
-        frames = [r[key] for r in results if key in r and not r[key].empty]
-        combined[key] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not combined["errors"].empty:
-        combined["by_rule"] = combined["errors"].groupby(["rule_id", "issue_type", "severity"], dropna=False).size().reset_index(name="count")
-    if not combined["checked_rows"].empty:
-        total_rows = len(combined["checked_rows"])
-        rows_with_issues = int((combined["checked_rows"]["issue_count"] > 0).sum())
-        combined["portfolio_summary"] = pd.DataFrame([
-            {"metric": "Files checked", "value": combined["checked_rows"]["file_name"].nunique()},
-            {"metric": "Report rows", "value": total_rows},
-            {"metric": "Rows with issues", "value": rows_with_issues},
-            {"metric": "Rows OK", "value": total_rows - rows_with_issues},
-            {"metric": "Total issues", "value": len(combined["errors"])},
-        ])
+        merge_key = f"__merge_key_{key}"
+        out[merge_key] = out[key].map(normalize_merge_key_value)
+        errors_for_count[merge_key] = errors_for_count[key].map(normalize_merge_key_value)
+        merge_keys.append(merge_key)
+
+    issue_counts = errors_for_count.groupby(merge_keys, dropna=False).size().reset_index(name="display_issue_count")
+    out = out.merge(issue_counts, on=merge_keys, how="left")
+    out["issue_count"] = out["display_issue_count"].fillna(0).astype(int)
+    return out.drop(columns=["display_issue_count", *merge_keys])
+
+
+def build_portfolio_summary(checked_rows_df: pd.DataFrame, errors_df: pd.DataFrame) -> pd.DataFrame:
+    rows_total = len(checked_rows_df)
+    rows_with_errors = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) > 0).sum()) if rows_total else 0
+    rows_ok = int((checked_rows_df.get("issue_count", pd.Series(dtype=int)) == 0).sum()) if rows_total else 0
+    files_checked = checked_rows_df["file_name"].nunique() if "file_name" in checked_rows_df.columns else 0
+    return pd.DataFrame(
+        [
+            {"metric": "Files checked", "value": files_checked},
+            {"metric": "Report rows", "value": rows_total},
+            {"metric": "Rows with issues", "value": rows_with_errors},
+            {"metric": "Rows OK", "value": rows_ok},
+            {"metric": "Total issues", "value": len(errors_df)},
+        ]
+    )
+
+
+def apply_rule_display_filter(combined_result: dict, selected_rules: list[str]) -> dict:
+    """Apply the selected rule filter to displayed dashboard output only."""
+    scoped = dict(combined_result)
+    errors_raw = combined_result["errors"].copy()
+    checked_rows_raw = combined_result["checked_rows"].copy()
+
+    if selected_rules and not errors_raw.empty and "issue_type" in errors_raw.columns:
+        errors = errors_raw[errors_raw["issue_type"].astype(str).isin(selected_rules)].copy()
+    elif selected_rules:
+        errors = errors_raw.copy()
     else:
-        combined["portfolio_summary"] = pd.DataFrame(columns=["metric", "value"])
-    return combined
+        errors = errors_raw.iloc[0:0].copy()
+
+    checked_rows = rebuild_checked_rows_issue_counts(checked_rows_raw, errors)
+    by_rule = (
+        errors.groupby("issue_type", dropna=False).size().reset_index(name="count")
+        if not errors.empty and "issue_type" in errors.columns
+        else pd.DataFrame(columns=["issue_type", "count"])
+    )
+
+    scoped["errors"] = errors
+    scoped["checked_rows"] = checked_rows
+    scoped["by_rule"] = by_rule
+    scoped["portfolio_summary"] = build_portfolio_summary(checked_rows, errors)
+    return scoped
 
 
-def results_to_excel_bytes(results: Dict[str, pd.DataFrame]) -> bytes:
-    output = BytesIO()
-    sheet_map = {
-        "portfolio_summary": "Summary",
-        "captain_message": "Captain Message",
-        "recent_errors": "Recent Errors",
-        "daily_kpis": "Daily KPIs",
-        "by_severity": "By Severity",
-        "status_summary": "Status Summary",
-        "by_rule": "By Rule",
-        "errors": "Errors",
-        "checked_rows": "Checked Rows",
-        "skipped_rules": "Skipped Rules",
-        "rules": "Rules",
-        "columns": "Column Mapping",
-    }
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm", date_format="yyyy-mm-dd") as writer:
-        workbook = writer.book
-        header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
-        error_fmt = workbook.add_format({"bg_color": "#FDE9D9"})
-        ok_fmt = workbook.add_format({"bg_color": "#E2F0D9"})
-        for key, sheet in sheet_map.items():
-            df = results.get(key, pd.DataFrame())
-            if df is None or df.empty:
-                df = pd.DataFrame({"note": ["No rows"]})
-            df.to_excel(writer, sheet_name=sheet, index=False)
-            worksheet = writer.sheets[sheet]
-            for col_num, value in enumerate(df.columns.values):
-                worksheet.write(0, col_num, value, header_fmt)
-                width = min(max(len(str(value)) + 2, 12), 45)
-                try:
-                    sample = df.iloc[:100, col_num].astype(str).map(len).max()
-                    if pd.notna(sample):
-                        width = min(max(width, int(sample) + 2), 55)
-                except Exception:
-                    pass
-                worksheet.set_column(col_num, col_num, width)
-            worksheet.freeze_panes(1, 0)
-            if len(df) > 0 and len(df.columns) > 0:
-                worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
-            if sheet == "Checked Rows" and "issue_count" in df.columns:
-                issue_idx = list(df.columns).index("issue_count")
-                worksheet.conditional_format(1, issue_idx, len(df), issue_idx, {"type": "cell", "criteria": ">", "value": 0, "format": error_fmt})
-                worksheet.conditional_format(1, issue_idx, len(df), issue_idx, {"type": "cell", "criteria": "==", "value": 0, "format": ok_fmt})
-        workbook.set_properties({"title": "Noon Report Validation Results", "subject": "ANTHEA-style Streamlit checker output"})
-    return output.getvalue()
+def get_fleet_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
+    """Return fleet names available in the loaded source."""
+    values = []
+    for df in (errors_df, rows_df):
+        if not df.empty and "fleet" in df.columns:
+            fleet_values = df["fleet"].dropna().astype(str).str.strip()
+            values.extend(fleet_values[fleet_values.ne("")].unique().tolist())
+    return sorted(set(values))
+
+
+def apply_fleet_filter(df: pd.DataFrame, fleet_name: str) -> pd.DataFrame:
+    """Filter a dataframe by fleet while preserving the original dataframe."""
+    if df.empty or "fleet" not in df.columns or fleet_name == "All fleets":
+        return df.copy()
+    fleet_values = df["fleet"].fillna("").astype(str).str.strip()
+    return df[fleet_values.eq(str(fleet_name).strip())].copy()
+
+
+def get_vessel_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
+    values = []
+    for df in (errors_df, rows_df):
+        if not df.empty and "ship_name" in df.columns:
+            vessel_values = df["ship_name"].dropna().astype(str).str.strip()
+            values.extend(vessel_values[vessel_values.ne("")].unique().tolist())
+    return sorted(set(values))
+
+
+def apply_vessel_filter(df: pd.DataFrame, vessel_name: str) -> pd.DataFrame:
+    if df.empty or "ship_name" not in df.columns or vessel_name == "All vessels":
+        return df.copy()
+    vessel_values = df["ship_name"].fillna("").astype(str).str.strip()
+    return df[vessel_values.eq(str(vessel_name).strip())].copy()
+
+
+# -----------------------------------------------------------------------------
+# Sidebar controls
+# -----------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("Validation thresholds")
+
+    config = DEFAULT_CONFIG.copy()
+    with st.expander("Rule filter", expanded=True):
+        rule_options = get_rule_options()
+        default_rules = [rule for rule in rule_options if "sludge" not in rule.lower()]
+
+        selected_rules = st.multiselect(
+            "Rules to show",
+            options=rule_options,
+            default=default_rules,
+            help="Display filter only. Validation runs all rules once; changing this updates the dashboard without rerunning validation.",
+        )
+
+
+    with st.expander("Sea passage / performance", expanded=True):
+        config["low_steaming_hours"] = st.number_input("Low steaming below hours", value=float(DEFAULT_CONFIG["low_steaming_hours"]), step=0.5)
+        config["slip_min"] = st.number_input("Slip min", value=float(DEFAULT_CONFIG["slip_min"]), step=0.01, format="%.2f")
+        config["slip_max"] = st.number_input("Slip max", value=float(DEFAULT_CONFIG["slip_max"]), step=0.01, format="%.2f")
+        config["me_load_min"] = st.number_input("ME Load min", value=float(DEFAULT_CONFIG["me_load_min"]), step=0.01, format="%.2f")
+        config["me_load_max"] = st.number_input("ME Load max", value=float(DEFAULT_CONFIG["me_load_max"]), step=0.01, format="%.2f")
+
+    with st.expander("Consumption / ROB", expanded=False):
+        config["electric_load_min_kw"] = st.number_input("Electric load min kW", value=float(DEFAULT_CONFIG["electric_load_min_kw"]), step=50.0)
+        config["electric_load_max_kw"] = st.number_input("Electric load max kW", value=float(DEFAULT_CONFIG["electric_load_max_kw"]), step=100.0)
+        config["mgo_rob_min_mt"] = st.number_input("MGO ROB min MT", value=float(DEFAULT_CONFIG["mgo_rob_min_mt"]), step=5.0)
+        config["boiler_cons_max_mt"] = st.number_input("Boiler cons max MT", value=float(DEFAULT_CONFIG["boiler_cons_max_mt"]), step=0.5)
+        config["dg_cons_high_mt"] = st.number_input("DG cons high MT", value=float(DEFAULT_CONFIG["dg_cons_high_mt"]), step=0.5)
+        config["dg_cons_low_mt"] = st.number_input("DG cons low MT", value=float(DEFAULT_CONFIG["dg_cons_low_mt"]), step=0.1)
+
+    with st.expander("Multiple DGs rule", expanded=False):
+        config["dg_power_running_threshold_kw"] = st.number_input(
+            "DG counted as running above kW",
+            value=float(DEFAULT_CONFIG.get("dg_power_running_threshold_kw", 10.0)),
+            step=1.0,
+            key="dg_power_running_threshold_kw_input",
+            help=(
+                "Used by the Multiple DGs rule. A DG with power above this value is counted as running. "
+                "The result changes only when this value crosses the actual DG1/DG2/DG3/DG4 power values in the report."
+            ),
+        )
+        config["dg_optimization_load_factor"] = st.number_input(
+            "Multiple DGs load factor",
+            value=float(DEFAULT_CONFIG.get("dg_optimization_load_factor", 0.70)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            format="%.2f",
+            key="dg_optimization_load_factor_input",
+            help="Used in the formula: sum(DG power / DG MCR) < factor * (running DGs - 1).",
+        )
+        st.caption(
+            "Tip: the kW threshold controls only how many DGs are counted as running. "
+            "The exported Checked Rows sheet includes Multiple DGs diagnostic columns so you can verify the DG threshold and formula result."
+        )
+
+    with st.expander("Advanced", expanded=False):
+        config["sfoc_min"] = st.number_input("SFOC min", value=float(DEFAULT_CONFIG["sfoc_min"]), step=5.0)
+        config["sfoc_max"] = st.number_input("SFOC max", value=float(DEFAULT_CONFIG["sfoc_max"]), step=5.0)
+        config["torque_power_min_kw"] = st.number_input("Torque power min kW", value=float(DEFAULT_CONFIG["torque_power_min_kw"]), step=100.0)
+        config["torque_power_max_kw"] = st.number_input("Torque power max kW", value=float(DEFAULT_CONFIG["torque_power_max_kw"]), step=100.0)
+        config["difference_pct_avg_band"] = st.number_input("Consumption % average band", value=float(DEFAULT_CONFIG["difference_pct_avg_band"]), step=0.01, format="%.2f")
+        config["distance_tolerance_pct"] = st.number_input("Distance tolerance %", value=float(DEFAULT_CONFIG["distance_tolerance_pct"]), step=0.01, format="%.2f")
+
+
+# -----------------------------------------------------------------------------
+# Data source
+# -----------------------------------------------------------------------------
+
+source_mode = st.radio(
+    "Data source",
+    ["Department auto source", "Manual upload"],
+    index=0,
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+uploaded_files = []
+
+if "auto_source_refresh_token" not in st.session_state:
+    st.session_state["auto_source_refresh_token"] = 0
+
+if source_mode == "Department auto source":
+    auto_source_url = st.secrets.get("AUTO_SOURCE_URL", "")
+    auto_source_file_name = st.secrets.get("AUTO_SOURCE_FILE_NAME", "All vessels.xlsx")
+
+    reload_col, _ = st.columns([1, 4])
+    if reload_col.button("Reload source file", use_container_width=True):
+        st.session_state["auto_source_refresh_token"] += 1
+
+    try:
+        auto_payload = fetch_auto_source_file(
+            auto_source_url,
+            st.session_state["auto_source_refresh_token"],
+        )
+        uploaded_files = [MemoryUploadedFile(auto_source_file_name, auto_payload)]
+    except Exception as exc:  # noqa: BLE001 - user-facing source error
+        st.error(f"Department auto source could not be loaded: {exc}")
+        st.info("Switch to Manual upload as backup, or update AUTO_SOURCE_URL in Streamlit Secrets.")
+        st.stop()
+
+else:
+    uploaded_files = st.file_uploader(
+        "Upload one or more Excel files",
+        type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="Use a Power Query refreshed file. For fleet mode, upload one unified Excel for all vessels.",
+    )
+
+    if not uploaded_files:
+        st.stop()
+
+with st.expander("Validation rules included", expanded=False):
+    st.dataframe(pd.DataFrame(RULES), use_container_width=True, hide_index=True)
+
+
+# -----------------------------------------------------------------------------
+# Validation execution
+# -----------------------------------------------------------------------------
+
+current_source_signature = build_source_signature(uploaded_files)
+current_config_signature = build_config_signature(config)
+
+for key, default in {
+    "validation_combined": None,
+    "validation_failed": [],
+    "validation_source_signature": None,
+    "validation_config_signature": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def run_validation_and_store(progress_text: str) -> None:
+    """Run full validation and store the raw result.
+
+    Rule selection is applied later as a dashboard filter, without rerunning validation.
+    Validation thresholds are calculation parameters, so threshold changes trigger
+    immediate revalidation after the first run.
+    """
+    all_results = []
+    failed = []
+    progress = st.progress(0, text=progress_text)
+
+    for pos, uploaded in enumerate(uploaded_files, start=1):
+        try:
+            payload = uploaded.getvalue()
+            result = validate_excel_file(BytesIO(payload), file_name=uploaded.name, config=config)
+            all_results.append(result)
+        except Exception as exc:  # noqa: BLE001 - show user-facing file errors in Streamlit
+            failed.append({"file_name": uploaded.name, "error": str(exc)})
+        progress.progress(pos / len(uploaded_files), text=f"Validated {pos}/{len(uploaded_files)} files")
+
+    progress.empty()
+
+    if all_results:
+        st.session_state["validation_combined"] = combine_results(all_results)
+        st.session_state["validation_source_signature"] = current_source_signature
+        st.session_state["validation_config_signature"] = current_config_signature
+    else:
+        st.session_state["validation_combined"] = None
+
+    st.session_state["validation_failed"] = failed
+
+
+run = st.button("Run validation", type="primary", use_container_width=True)
+
+source_changed_after_run = (
+    st.session_state["validation_combined"] is not None
+    and st.session_state["validation_source_signature"] != current_source_signature
+)
+thresholds_changed_after_run = (
+    st.session_state["validation_combined"] is not None
+    and st.session_state["validation_config_signature"] != current_config_signature
+)
+
+if run:
+    run_validation_and_store("Starting validation...")
+elif source_changed_after_run:
+    run_validation_and_store("Source file changed. Revalidating automatically...")
+elif thresholds_changed_after_run:
+    run_validation_and_store("Validation thresholds changed. Revalidating automatically...")
+
+if st.session_state["validation_combined"] is None:
+    st.info("Run validation once. After that, vessel/day/rule/report filters work without rerunning validation. Threshold changes will revalidate automatically.")
+    st.stop()
+
+failed = st.session_state["validation_failed"]
+if failed:
+    st.error("Some files could not be validated.")
+    st.dataframe(pd.DataFrame(failed), use_container_width=True, hide_index=True)
+
+raw_combined = st.session_state["validation_combined"]
+combined = apply_rule_display_filter(raw_combined, selected_rules)
+summary = combined["portfolio_summary"]
+errors = combined["errors"]
+checked_rows = combined["checked_rows"]
+by_rule = combined["by_rule"]
+skipped_rules = combined["skipped_rules"]
+
+errors_dated_all = with_report_dates(errors) if not errors.empty else errors.copy()
+checked_rows_dated_all = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
+
+# Use the full loaded source window.
+# The source file itself controls the time span; dashboard filters should not silently cut it down.
+errors_dated = errors_dated_all.copy()
+checked_rows_dated = checked_rows_dated_all.copy()
+recent_errors = errors_dated.copy()
+data_window_caption = get_data_window_caption(checked_rows_dated, errors_dated)
+
+
+# -----------------------------------------------------------------------------
+# Fleet and vessel selection / drill-down
+# -----------------------------------------------------------------------------
+
+fleet_options = get_fleet_options(errors_dated, checked_rows_dated)
+valid_fleets = ["All fleets"] + fleet_options
+
+if (
+    "selected_fleet_filter" not in st.session_state
+    or st.session_state["selected_fleet_filter"] not in valid_fleets
+):
+    st.session_state["selected_fleet_filter"] = "All fleets"
+
+st.divider()
+st.subheader("Fleet and vessel selection")
+fleet_col, vessel_col = st.columns(2)
+
+with fleet_col:
+    selected_fleet = st.selectbox(
+        "Search or select fleet",
+        options=valid_fleets,
+        key="selected_fleet_filter",
+        help="Use All fleets for the complete source, or select one fleet to restrict the dashboard.",
+    )
+
+# Apply fleet selection first so the vessel dropdown only contains vessels
+# belonging to the selected fleet.
+errors_fleet_scope = apply_fleet_filter(errors_dated, selected_fleet)
+recent_errors_fleet_scope = apply_fleet_filter(recent_errors, selected_fleet)
+checked_rows_fleet_scope = apply_fleet_filter(checked_rows_dated, selected_fleet)
+
+vessel_options = get_vessel_options(errors_fleet_scope, checked_rows_fleet_scope)
+valid_vessels = ["All vessels"] + vessel_options
+
+if (
+    "selected_vessel_filter" not in st.session_state
+    or st.session_state["selected_vessel_filter"] not in valid_vessels
+):
+    st.session_state["selected_vessel_filter"] = "All vessels"
+
+with vessel_col:
+    selected_vessel = st.selectbox(
+        "Search or select vessel",
+        options=valid_vessels,
+        key="selected_vessel_filter",
+        help="The available vessels are restricted by the selected fleet.",
+    )
+
+# Build the vessel overview within the selected fleet. Include the Fleet column
+# when it exists so the all-fleets view remains easy to understand.
+if vessel_options:
+    row_group_cols = [c for c in ["fleet", "ship_name"] if c in checked_rows_fleet_scope.columns]
+    vessel_rows_summary = (
+        checked_rows_fleet_scope.groupby(row_group_cols, dropna=False)
+        .agg(
+            report_rows=("excel_row", "count"),
+            rows_with_errors=("issue_count", lambda s: int((s > 0).sum())),
+            rows_ok=("issue_count", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+        .rename(columns={"fleet": "Fleet", "ship_name": "Vessel"})
+    )
+
+    if not errors_fleet_scope.empty and "ship_name" in errors_fleet_scope.columns:
+        error_group_cols = [c for c in ["fleet", "ship_name"] if c in errors_fleet_scope.columns]
+        vessel_errors_summary = (
+            errors_fleet_scope.groupby(error_group_cols, dropna=False)
+            .agg(
+                total_errors=("issue_type", "count"),
+                high_severity_errors=("severity", lambda s: int(s.astype(str).eq("High").sum())),
+            )
+            .reset_index()
+            .rename(columns={"fleet": "Fleet", "ship_name": "Vessel"})
+        )
+    else:
+        error_summary_cols = ["Vessel", "total_errors", "high_severity_errors"]
+        if "Fleet" in vessel_rows_summary.columns:
+            error_summary_cols.insert(0, "Fleet")
+        vessel_errors_summary = pd.DataFrame(columns=error_summary_cols)
+
+    summary_merge_keys = [c for c in ["Fleet", "Vessel"] if c in vessel_rows_summary.columns and c in vessel_errors_summary.columns]
+    vessel_summary = vessel_rows_summary.merge(vessel_errors_summary, on=summary_merge_keys, how="left")
+    vessel_summary[["total_errors", "high_severity_errors"]] = (
+        vessel_summary[["total_errors", "high_severity_errors"]].fillna(0).astype(int)
+    )
+    vessel_summary["error_row_rate"] = (
+        vessel_summary["rows_with_errors"] / vessel_summary["report_rows"].replace(0, pd.NA)
+    )
+    vessel_summary = vessel_summary.sort_values(
+        ["high_severity_errors", "total_errors", "error_row_rate"],
+        ascending=[False, False, False],
+    )
+else:
+    vessel_summary = pd.DataFrame()
+
+# Apply the vessel filter after the fleet filter. All dashboard tabs and exports
+# below use these scoped dataframes.
+errors_scope = apply_vessel_filter(errors_fleet_scope, selected_vessel)
+recent_errors_scope = apply_vessel_filter(recent_errors_fleet_scope, selected_vessel)
+checked_rows_scope = apply_vessel_filter(checked_rows_fleet_scope, selected_vessel)
+daily_kpis_scope = build_daily_kpis(checked_rows_scope, errors_scope)
+by_rule_scope = (
+    errors_scope.groupby("issue_type", dropna=False).size().reset_index(name="count")
+    if not errors_scope.empty and "issue_type" in errors_scope.columns
+    else pd.DataFrame(columns=["issue_type", "count"])
+)
+by_severity_scope = (
+    errors_scope.groupby("severity", dropna=False).size().reset_index(name="count")
+    if not errors_scope.empty and "severity" in errors_scope.columns
+    else pd.DataFrame(columns=["severity", "count"])
+)
+
+rows_total = len(checked_rows_scope)
+rows_with_errors = int((checked_rows_scope["issue_count"] > 0).sum()) if "issue_count" in checked_rows_scope.columns else 0
+rows_ok = int((checked_rows_scope["issue_count"] == 0).sum()) if "issue_count" in checked_rows_scope.columns else 0
+total_errors = len(errors_scope)
+error_rate = rows_with_errors / rows_total if rows_total else 0
+avg_errors_per_problem_row = total_errors / rows_with_errors if rows_with_errors else 0
+status_summary_scope = pd.DataFrame([{"status": "Rows with errors", "count": rows_with_errors}, {"status": "Rows OK", "count": rows_ok}])
+
+cols = st.columns(6)
+if selected_vessel != "All vessels":
+    current_view_label = selected_vessel
+elif selected_fleet != "All fleets":
+    current_view_label = selected_fleet
+else:
+    current_view_label = "All fleets"
+
+cols[0].metric("View", current_view_label)
+cols[1].metric("Rows", rows_total)
+cols[2].metric("Rows with errors", rows_with_errors)
+cols[3].metric("Rows OK", rows_ok)
+cols[4].metric("Total errors", total_errors)
+cols[5].metric("Error row rate", f"{error_rate:.1%}")
+
+st.caption(f"Fleet: {selected_fleet} | Vessel: {selected_vessel} | {data_window_caption}")
+
+# -----------------------------------------------------------------------------
+# Tabs
+# -----------------------------------------------------------------------------
+
+fleet_tab, main_tab, recent_tab, kpi_tab, rows_tab, export_tab = st.tabs(
+    ["Fleet overview", "All errors", "Report days", "KPI dashboard", "Checked rows", "Export / setup"]
+)
+
+with fleet_tab:
+    st.subheader("Fleet overview")
+    if vessel_summary.empty:
+        st.info("No vessel information found in the validation results.")
+    else:
+        overview_cols = st.columns(4)
+        overview_cols[0].metric("Vessels", vessel_summary["Vessel"].nunique())
+        overview_cols[1].metric("Fleet rows", int(vessel_summary["report_rows"].sum()))
+        overview_cols[2].metric("Fleet total errors", int(vessel_summary["total_errors"].sum()))
+        overview_cols[3].metric("Vessels with High errors", int((vessel_summary["high_severity_errors"] > 0).sum()))
+
+        display_summary = vessel_summary.copy()
+        display_summary["error_row_rate"] = display_summary["error_row_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+        st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+        st.subheader("Top vessels by total errors")
+        st.bar_chart(vessel_summary.sort_values("total_errors", ascending=False).head(10).set_index("Vessel")["total_errors"])
+
+with main_tab:
+    st.subheader("Errors")
+    if errors_scope.empty:
+        st.success("No validation errors found for this vessel selection.")
+    else:
+        left, mid, right = st.columns(3)
+        rule_filter = left.multiselect("Rule", sorted(errors_scope["issue_type"].dropna().unique().tolist()), default=sorted(errors_scope["issue_type"].dropna().unique().tolist()))
+        severity_filter = mid.multiselect("Severity", sorted(errors_scope["severity"].dropna().unique().tolist()), default=sorted(errors_scope["severity"].dropna().unique().tolist()))
+        report_type_options = sorted(errors_scope["report_type"].dropna().unique().tolist()) if "report_type" in errors_scope.columns else []
+        report_type_filter = right.multiselect("Report type", report_type_options, default=report_type_options)
+
+        view = errors_scope[
+            errors_scope["issue_type"].isin(rule_filter)
+            & errors_scope["severity"].isin(severity_filter)
+        ].copy()
+        if "report_type" in view.columns and report_type_filter:
+            view = view[view["report_type"].isin(report_type_filter)].copy()
+        display_error_table("Filtered errors", view)
+
+    if not by_rule_scope.empty:
+        st.subheader("Errors by rule")
+        st.dataframe(by_rule_scope.sort_values("count", ascending=False), use_container_width=True, hide_index=True)
+
+with recent_tab:
+    display_error_table("Problems in selected data window", recent_errors_scope)
+
+    # Report-day drilldown. Use checked rows first so dates with zero errors can still be selected.
+    if not checked_rows_scope.empty and "report_date" in checked_rows_scope.columns:
+        available_dates = sorted([d for d in checked_rows_scope["report_date"].dropna().unique().tolist()])
+    elif not errors_scope.empty and "report_date" in errors_scope.columns:
+        available_dates = sorted([d for d in errors_scope["report_date"].dropna().unique().tolist()])
+    else:
+        available_dates = []
+
+    if available_dates:
+        st.divider()
+
+        single_col, multi_col = st.columns(2)
+
+        with single_col:
+            selected_date = st.selectbox(
+                "Show problems for one specific report day",
+                options=available_dates,
+                index=len(available_dates) - 1,
+                format_func=format_report_date,
+            )
+
+        with multi_col:
+            default_multi_dates = available_dates[-2:] if len(available_dates) >= 2 else available_dates
+            selected_dates = st.multiselect(
+                "Show problems for multiple report days",
+                options=available_dates,
+                default=default_multi_dates,
+                format_func=format_report_date,
+                help="Select one or more report dates from the current vessel/source window.",
+            )
+
+        day_errors = errors_scope[errors_scope["report_date"].eq(selected_date)].copy() if not errors_scope.empty else errors_scope.copy()
+        display_error_table(f"Problems for {format_report_date(selected_date)}", day_errors)
+
+        if selected_dates:
+            multi_errors = errors_scope[errors_scope["report_date"].isin(selected_dates)].copy() if not errors_scope.empty else errors_scope.copy()
+            selected_dates_label = ", ".join(format_report_date(d) for d in selected_dates)
+            display_error_table("Problems for selected report days", multi_errors)
+            st.caption(f"Selected report days: {selected_dates_label}")
+        else:
+            st.info("Select one or more report days to see a combined problem table.")
+
+with kpi_tab:
+    st.subheader("KPI dashboard")
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("Recent errors", len(recent_errors_scope))
+    kpi_cols[1].metric("Avg errors / problem row", f"{avg_errors_per_problem_row:.2f}")
+    kpi_cols[2].metric("Unique error types", errors_scope["issue_type"].nunique() if not errors_scope.empty else 0)
+    kpi_cols[3].metric("High severity errors", int((errors_scope["severity"].eq("High")).sum()) if not errors_scope.empty and "severity" in errors_scope.columns else 0)
+
+    chart_left, chart_right = st.columns(2)
+    with chart_left:
+        if not status_summary_scope.empty and status_summary_scope["count"].sum() > 0:
+            st.altair_chart(pie_chart(status_summary_scope, "status", "count", "Rows OK vs rows with errors"), use_container_width=True)
+    with chart_right:
+        if not by_severity_scope.empty and by_severity_scope["count"].sum() > 0:
+            st.altair_chart(pie_chart(by_severity_scope, "severity", "count", "Errors by severity"), use_container_width=True)
+
+    if not by_rule_scope.empty:
+        st.subheader("Top error categories")
+        st.bar_chart(by_rule_scope.sort_values("count", ascending=False).head(10).set_index("issue_type")["count"])
+
+    if not daily_kpis_scope.empty:
+        st.subheader("Daily validation trend")
+        daily_for_chart = daily_kpis_scope.sort_values("report_date")
+        st.line_chart(daily_for_chart.set_index("report_date")[["total_errors", "rows_with_errors"]])
+        st.dataframe(daily_kpis_scope, use_container_width=True, hide_index=True)
+
+with rows_tab:
+    st.subheader("Checked rows")
+    st.dataframe(checked_rows_scope, use_container_width=True, hide_index=True)
+
+    if not skipped_rules.empty:
+        st.warning("Some rules were skipped because required columns were not found in at least one file.")
+        st.dataframe(skipped_rules, use_container_width=True, hide_index=True)
+
+with export_tab:
+    st.subheader("Export results")
+
+    errors_export_scope = add_copy_paste_issue_messages(errors_scope, selected_vessel)
+    recent_errors_export_scope = add_copy_paste_issue_messages(recent_errors_scope, selected_vessel)
+    captain_message_subject = build_captain_chief_engineer_subject(errors_scope, selected_vessel)
+    captain_message_text = build_captain_chief_engineer_message(errors_scope, selected_vessel)
+    captain_message_export = build_captain_message_df(errors_scope, selected_vessel)
+
+    combined_for_export = dict(combined)
+    combined_for_export["errors"] = errors_export_scope
+    combined_for_export["checked_rows"] = checked_rows_scope
+    combined_for_export["by_rule"] = by_rule_scope
+    combined_for_export["portfolio_summary"] = build_portfolio_summary(checked_rows_scope, errors_scope)
+    combined_for_export["recent_errors"] = recent_errors_export_scope
+    combined_for_export["daily_kpis"] = daily_kpis_scope
+    combined_for_export["by_severity"] = by_severity_scope
+    combined_for_export["status_summary"] = status_summary_scope
+    combined_for_export["captain_message"] = captain_message_export
+
+    excel_bytes = results_to_excel_bytes(combined_for_export)
+    st.download_button(
+        "Download Excel validation report for current selection",
+        data=excel_bytes,
+        file_name="noon_report_validation_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "Download current selection errors as CSV",
+        data=errors_export_scope.to_csv(index=False).encode("utf-8-sig"),
+        file_name="noon_report_errors_current_selection.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "Download selected data-window errors as CSV",
+        data=recent_errors_export_scope.to_csv(index=False).encode("utf-8-sig"),
+        file_name="noon_report_errors_selected_data_window.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.subheader("Copy-paste message to Captain / Chief Engineer")
+    st.caption(
+        "This message uses the current vessel/rule/date filters already applied in the dashboard. "
+        "Adjust the filters if the message contains too many issues."
+    )
+
+    if errors_scope.empty:
+        st.success("No validation issues were found for the current filtered selection.")
+    else:
+        st.info(f"Message includes {len(errors_scope)} issue(s) from the current filtered selection.")
+
+    st.text_input("Suggested subject", value=captain_message_subject)
+    st.text_area("Copy-ready message", value=captain_message_text, height=460)
+    st.download_button(
+        "Download Captain / Chief Engineer message as TXT",
+        data=f"Subject: {captain_message_subject}\n\n{captain_message_text}".encode("utf-8-sig"),
+        file_name="noon_report_captain_chief_engineer_message.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
