@@ -156,6 +156,7 @@ def display_error_table(title: str, df: pd.DataFrame) -> None:
         "file_name",
         "report_id",
         "ship_name",
+        "fleet",
         "report_type",
         "state_name",
         "issue_type",
@@ -765,18 +766,38 @@ def apply_rule_display_filter(combined_result: dict, selected_rules: list[str]) 
     return scoped
 
 
+def get_fleet_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
+    """Return fleet names available in the loaded source."""
+    values = []
+    for df in (errors_df, rows_df):
+        if not df.empty and "fleet" in df.columns:
+            fleet_values = df["fleet"].dropna().astype(str).str.strip()
+            values.extend(fleet_values[fleet_values.ne("")].unique().tolist())
+    return sorted(set(values))
+
+
+def apply_fleet_filter(df: pd.DataFrame, fleet_name: str) -> pd.DataFrame:
+    """Filter a dataframe by fleet while preserving the original dataframe."""
+    if df.empty or "fleet" not in df.columns or fleet_name == "All fleets":
+        return df.copy()
+    fleet_values = df["fleet"].fillna("").astype(str).str.strip()
+    return df[fleet_values.eq(str(fleet_name).strip())].copy()
+
+
 def get_vessel_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
     values = []
     for df in (errors_df, rows_df):
         if not df.empty and "ship_name" in df.columns:
-            values.extend(df["ship_name"].dropna().astype(str).unique().tolist())
-    return sorted(set(v for v in values if v.strip()))
+            vessel_values = df["ship_name"].dropna().astype(str).str.strip()
+            values.extend(vessel_values[vessel_values.ne("")].unique().tolist())
+    return sorted(set(values))
 
 
 def apply_vessel_filter(df: pd.DataFrame, vessel_name: str) -> pd.DataFrame:
     if df.empty or "ship_name" not in df.columns or vessel_name == "All vessels":
         return df.copy()
-    return df[df["ship_name"].astype(str).eq(vessel_name)].copy()
+    vessel_values = df["ship_name"].fillna("").astype(str).str.strip()
+    return df[vessel_values.eq(str(vessel_name).strip())].copy()
 
 
 # -----------------------------------------------------------------------------
@@ -996,68 +1017,105 @@ data_window_caption = get_data_window_caption(checked_rows_dated, errors_dated)
 
 
 # -----------------------------------------------------------------------------
-# Vessel selection / fleet drill-down
+# Fleet and vessel selection / drill-down
 # -----------------------------------------------------------------------------
 
-vessel_options = get_vessel_options(errors_dated, checked_rows_dated)
+fleet_options = get_fleet_options(errors_dated, checked_rows_dated)
+valid_fleets = ["All fleets"] + fleet_options
+
+if (
+    "selected_fleet_filter" not in st.session_state
+    or st.session_state["selected_fleet_filter"] not in valid_fleets
+):
+    st.session_state["selected_fleet_filter"] = "All fleets"
+
+st.divider()
+st.subheader("Fleet and vessel selection")
+fleet_col, vessel_col = st.columns(2)
+
+with fleet_col:
+    selected_fleet = st.selectbox(
+        "Search or select fleet",
+        options=valid_fleets,
+        key="selected_fleet_filter",
+        help="Use All fleets for the complete source, or select one fleet to restrict the dashboard.",
+    )
+
+# Apply fleet selection first so the vessel dropdown only contains vessels
+# belonging to the selected fleet.
+errors_fleet_scope = apply_fleet_filter(errors_dated, selected_fleet)
+recent_errors_fleet_scope = apply_fleet_filter(recent_errors, selected_fleet)
+checked_rows_fleet_scope = apply_fleet_filter(checked_rows_dated, selected_fleet)
+
+vessel_options = get_vessel_options(errors_fleet_scope, checked_rows_fleet_scope)
 valid_vessels = ["All vessels"] + vessel_options
-if "selected_vessel_filter" not in st.session_state or st.session_state["selected_vessel_filter"] not in valid_vessels:
+
+if (
+    "selected_vessel_filter" not in st.session_state
+    or st.session_state["selected_vessel_filter"] not in valid_vessels
+):
     st.session_state["selected_vessel_filter"] = "All vessels"
 
+with vessel_col:
+    selected_vessel = st.selectbox(
+        "Search or select vessel",
+        options=valid_vessels,
+        key="selected_vessel_filter",
+        help="The available vessels are restricted by the selected fleet.",
+    )
+
+# Build the vessel overview within the selected fleet. Include the Fleet column
+# when it exists so the all-fleets view remains easy to understand.
 if vessel_options:
+    row_group_cols = [c for c in ["fleet", "ship_name"] if c in checked_rows_fleet_scope.columns]
     vessel_rows_summary = (
-        checked_rows_dated.groupby("ship_name", dropna=False)
+        checked_rows_fleet_scope.groupby(row_group_cols, dropna=False)
         .agg(
             report_rows=("excel_row", "count"),
             rows_with_errors=("issue_count", lambda s: int((s > 0).sum())),
             rows_ok=("issue_count", lambda s: int((s == 0).sum())),
         )
         .reset_index()
-        .rename(columns={"ship_name": "Vessel"})
+        .rename(columns={"fleet": "Fleet", "ship_name": "Vessel"})
     )
-    vessel_errors_summary = (
-        errors_dated.groupby("ship_name", dropna=False)
-        .agg(
-            total_errors=("issue_type", "count"),
-            high_severity_errors=("severity", lambda s: int((s == "High").sum())),
+
+    if not errors_fleet_scope.empty and "ship_name" in errors_fleet_scope.columns:
+        error_group_cols = [c for c in ["fleet", "ship_name"] if c in errors_fleet_scope.columns]
+        vessel_errors_summary = (
+            errors_fleet_scope.groupby(error_group_cols, dropna=False)
+            .agg(
+                total_errors=("issue_type", "count"),
+                high_severity_errors=("severity", lambda s: int(s.astype(str).eq("High").sum())),
+            )
+            .reset_index()
+            .rename(columns={"fleet": "Fleet", "ship_name": "Vessel"})
         )
-        .reset_index()
-        .rename(columns={"ship_name": "Vessel"})
-        if not errors_dated.empty and "ship_name" in errors_dated.columns
-        else pd.DataFrame(columns=["Vessel", "total_errors", "high_severity_errors"])
+    else:
+        error_summary_cols = ["Vessel", "total_errors", "high_severity_errors"]
+        if "Fleet" in vessel_rows_summary.columns:
+            error_summary_cols.insert(0, "Fleet")
+        vessel_errors_summary = pd.DataFrame(columns=error_summary_cols)
+
+    summary_merge_keys = [c for c in ["Fleet", "Vessel"] if c in vessel_rows_summary.columns and c in vessel_errors_summary.columns]
+    vessel_summary = vessel_rows_summary.merge(vessel_errors_summary, on=summary_merge_keys, how="left")
+    vessel_summary[["total_errors", "high_severity_errors"]] = (
+        vessel_summary[["total_errors", "high_severity_errors"]].fillna(0).astype(int)
     )
-    vessel_summary = vessel_rows_summary.merge(vessel_errors_summary, on="Vessel", how="left")
-    vessel_summary[["total_errors", "high_severity_errors"]] = vessel_summary[["total_errors", "high_severity_errors"]].fillna(0).astype(int)
-    vessel_summary["error_row_rate"] = vessel_summary["rows_with_errors"] / vessel_summary["report_rows"].replace(0, pd.NA)
-    vessel_summary = vessel_summary.sort_values(["high_severity_errors", "total_errors", "error_row_rate"], ascending=[False, False, False])
+    vessel_summary["error_row_rate"] = (
+        vessel_summary["rows_with_errors"] / vessel_summary["report_rows"].replace(0, pd.NA)
+    )
+    vessel_summary = vessel_summary.sort_values(
+        ["high_severity_errors", "total_errors", "error_row_rate"],
+        ascending=[False, False, False],
+    )
 else:
     vessel_summary = pd.DataFrame()
 
-if vessel_options:
-    st.divider()
-    st.subheader("Vessel selection")
-    button_cols = st.columns(6)
-    if button_cols[0].button("All vessels", use_container_width=True):
-        st.session_state["selected_vessel_filter"] = "All vessels"
-    top_button_vessels = vessel_summary.sort_values("total_errors", ascending=False).head(5)
-    for idx, row in enumerate(top_button_vessels.itertuples(index=False), start=1):
-        label = f"{str(row.Vessel)[:18]} ({int(row.total_errors)})"
-        if button_cols[idx].button(label, use_container_width=True):
-            st.session_state["selected_vessel_filter"] = str(row.Vessel)
-
-    selected_vessel = st.selectbox(
-        "Search or select vessel",
-        options=valid_vessels,
-        index=valid_vessels.index(st.session_state["selected_vessel_filter"]),
-        help="Use All vessels for fleet view, or select one vessel to drill down.",
-    )
-    st.session_state["selected_vessel_filter"] = selected_vessel
-else:
-    selected_vessel = "All vessels"
-
-errors_scope = apply_vessel_filter(errors_dated, selected_vessel)
-recent_errors_scope = apply_vessel_filter(recent_errors, selected_vessel)
-checked_rows_scope = apply_vessel_filter(checked_rows_dated, selected_vessel)
+# Apply the vessel filter after the fleet filter. All dashboard tabs and exports
+# below use these scoped dataframes.
+errors_scope = apply_vessel_filter(errors_fleet_scope, selected_vessel)
+recent_errors_scope = apply_vessel_filter(recent_errors_fleet_scope, selected_vessel)
+checked_rows_scope = apply_vessel_filter(checked_rows_fleet_scope, selected_vessel)
 daily_kpis_scope = build_daily_kpis(checked_rows_scope, errors_scope)
 by_rule_scope = (
     errors_scope.groupby("issue_type", dropna=False).size().reset_index(name="count")
@@ -1079,14 +1137,21 @@ avg_errors_per_problem_row = total_errors / rows_with_errors if rows_with_errors
 status_summary_scope = pd.DataFrame([{"status": "Rows with errors", "count": rows_with_errors}, {"status": "Rows OK", "count": rows_ok}])
 
 cols = st.columns(6)
-cols[0].metric("View", selected_vessel)
+if selected_vessel != "All vessels":
+    current_view_label = selected_vessel
+elif selected_fleet != "All fleets":
+    current_view_label = selected_fleet
+else:
+    current_view_label = "All fleets"
+
+cols[0].metric("View", current_view_label)
 cols[1].metric("Rows", rows_total)
 cols[2].metric("Rows with errors", rows_with_errors)
 cols[3].metric("Rows OK", rows_ok)
 cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
-st.caption(data_window_caption)
+st.caption(f"Fleet: {selected_fleet} | Vessel: {selected_vessel} | {data_window_caption}")
 
 # -----------------------------------------------------------------------------
 # Tabs
