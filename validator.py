@@ -45,6 +45,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 COLUMN_ALIASES: Dict[str, List[str]] = {
     "report_id": ["ReportId", "Report ID"],
     "ship_name": ["ShipName", "Ship Name", "Vessel"],
+    "fleet": ["Fleet", "Fleet Group", "FleetGroup"],
     "report_type": ["Report Type"],
     "start_gmt": ["Start Date & Time GMT", "Start Date Time GMT", "Start GMT"],
     "end_gmt": ["End Date & Time GMT", "End Date Time GMT", "End GMT"],
@@ -245,6 +246,7 @@ class ValidationError:
     excel_row: int
     report_id: Any
     ship_name: Any
+    fleet: Any
     report_type: Any
     start_gmt: Any
     end_gmt: Any
@@ -424,6 +426,7 @@ def build_error(
         excel_row=int(idx) + 2,
         report_id=safe_display(col(df, mapping, "report_id").iloc[idx]),
         ship_name=safe_display(col(df, mapping, "ship_name").iloc[idx]),
+        fleet=safe_display(col(df, mapping, "fleet").iloc[idx]),
         report_type=safe_display(col(df, mapping, "report_type").iloc[idx]),
         start_gmt=safe_display(col(df, mapping, "start_gmt").iloc[idx]),
         end_gmt=safe_display(col(df, mapping, "end_gmt").iloc[idx]),
@@ -672,6 +675,7 @@ def validate_noon_report(
         "excel_row": np.arange(2, n + 2),
         "report_id": col(df, mapping, "report_id"),
         "ship_name": col(df, mapping, "ship_name"),
+        "fleet": col(df, mapping, "fleet"),
         "report_type": col(df, mapping, "report_type"),
         "start_gmt": col(df, mapping, "start_gmt"),
         "end_gmt": col(df, mapping, "end_gmt"),
