@@ -16,7 +16,6 @@ APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_DG_OPTIMISATION"
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
 st.title("Noon Report Checker")
-st.caption("Build: FLEET_LABELS_V3_EXACT_ENTRYPOINT")
 
 
 # -----------------------------------------------------------------------------
