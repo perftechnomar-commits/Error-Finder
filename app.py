@@ -16,6 +16,7 @@ APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_DG_OPTIMISATION"
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
 st.title("Noon Report Checker")
+st.caption("Build: FLEET_LABELS_V3_EXACT_ENTRYPOINT")
 
 
 # -----------------------------------------------------------------------------
@@ -766,14 +767,48 @@ def apply_rule_display_filter(combined_result: dict, selected_rules: list[str]) 
     return scoped
 
 
+def format_fleet_label(value: object) -> str:
+    """Display source values such as 1, 1.0, or Fleet 1 as Fleet 1."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    numeric_text = text[5:].strip() if text.lower().startswith("fleet") else text
+    try:
+        number = float(numeric_text)
+        if number.is_integer():
+            return f"Fleet {int(number)}"
+    except (TypeError, ValueError):
+        pass
+
+    return text
+
+
+def fleet_sort_key(value: object) -> tuple[int, int | str]:
+    """Sort numbered fleets by their number instead of alphabetically."""
+    label = format_fleet_label(value)
+    if label.lower().startswith("fleet "):
+        try:
+            return (0, int(label[6:].strip()))
+        except ValueError:
+            pass
+    return (1, label.casefold())
+
+
 def get_fleet_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
-    """Return fleet names available in the loaded source."""
+    """Return raw fleet values, sorted numerically for display."""
     values = []
     for df in (errors_df, rows_df):
         if not df.empty and "fleet" in df.columns:
             fleet_values = df["fleet"].dropna().astype(str).str.strip()
             values.extend(fleet_values[fleet_values.ne("")].unique().tolist())
-    return sorted(set(values))
+    return sorted(set(values), key=fleet_sort_key)
 
 
 def apply_fleet_filter(df: pd.DataFrame, fleet_name: str) -> pd.DataFrame:
@@ -1038,6 +1073,7 @@ with fleet_col:
         "Search or select fleet",
         options=valid_fleets,
         key="selected_fleet_filter",
+        format_func=lambda value: value if value == "All fleets" else format_fleet_label(value),
         help="Use All fleets for the complete source, or select one fleet to restrict the dashboard.",
     )
 
@@ -1140,7 +1176,7 @@ cols = st.columns(6)
 if selected_vessel != "All vessels":
     current_view_label = selected_vessel
 elif selected_fleet != "All fleets":
-    current_view_label = selected_fleet
+    current_view_label = format_fleet_label(selected_fleet)
 else:
     current_view_label = "All fleets"
 
@@ -1151,7 +1187,8 @@ cols[3].metric("Rows OK", rows_ok)
 cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
-st.caption(f"Fleet: {selected_fleet} | Vessel: {selected_vessel} | {data_window_caption}")
+selected_fleet_display = selected_fleet if selected_fleet == "All fleets" else format_fleet_label(selected_fleet)
+st.caption(f"Fleet: {selected_fleet_display} | Vessel: {selected_vessel} | {data_window_caption}")
 
 # -----------------------------------------------------------------------------
 # Tabs
@@ -1173,6 +1210,8 @@ with fleet_tab:
         overview_cols[3].metric("Vessels with High errors", int((vessel_summary["high_severity_errors"] > 0).sum()))
 
         display_summary = vessel_summary.copy()
+        if "Fleet" in display_summary.columns:
+            display_summary["Fleet"] = display_summary["Fleet"].map(format_fleet_label)
         display_summary["error_row_rate"] = display_summary["error_row_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
         st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
