@@ -11,7 +11,7 @@ import streamlit as st
 
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "AUTO_SOURCE_FLEET_FINAL_2026_05_21_DG_OPTIMISATION"
+APP_BUILD = "AUTO_SOURCE_FLEET_STATE_FILTER_FLEET_CHART_2026_07_23"
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -818,6 +818,27 @@ def apply_fleet_filter(df: pd.DataFrame, fleet_name: str) -> pd.DataFrame:
     return df[fleet_values.eq(str(fleet_name).strip())].copy()
 
 
+def get_state_name_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
+    """Return the unique State Name values available in the validated source."""
+    values = []
+    for df in (errors_df, rows_df):
+        if not df.empty and "state_name" in df.columns:
+            state_values = df["state_name"].dropna().astype(str).str.strip()
+            values.extend(state_values[state_values.ne("")].unique().tolist())
+    return sorted(set(values), key=str.casefold)
+
+
+def apply_state_name_filter(df: pd.DataFrame, selected_states: list[str]) -> pd.DataFrame:
+    """Filter a dataframe to the selected State Name values."""
+    if df.empty or "state_name" not in df.columns:
+        return df.copy()
+    if not selected_states:
+        return df.iloc[0:0].copy()
+    state_values = df["state_name"].fillna("").astype(str).str.strip()
+    selected = {str(value).strip() for value in selected_states}
+    return df[state_values.isin(selected)].copy()
+
+
 def get_vessel_options(errors_df: pd.DataFrame, rows_df: pd.DataFrame) -> list[str]:
     values = []
     for df in (errors_df, rows_df):
@@ -1042,10 +1063,42 @@ skipped_rules = combined["skipped_rules"]
 errors_dated_all = with_report_dates(errors) if not errors.empty else errors.copy()
 checked_rows_dated_all = with_report_dates(checked_rows) if not checked_rows.empty else checked_rows.copy()
 
-# Use the full loaded source window.
-# The source file itself controls the time span; dashboard filters should not silently cut it down.
-errors_dated = errors_dated_all.copy()
-checked_rows_dated = checked_rows_dated_all.copy()
+# State Name is a display filter. It is populated from the unique source values
+# and does not trigger validation again. The filter is applied before fleet and
+# vessel selection so all KPIs, charts, tables, exports, and messages follow it.
+state_name_options = get_state_name_options(errors_dated_all, checked_rows_dated_all)
+state_filter_key = "selected_state_name_filter"
+
+if state_name_options:
+    existing_state_selection = st.session_state.get(state_filter_key)
+    if (
+        not isinstance(existing_state_selection, list)
+        or any(value not in state_name_options for value in existing_state_selection)
+    ):
+        st.session_state[state_filter_key] = state_name_options.copy()
+
+    with st.sidebar.expander("State Name filter", expanded=True):
+        selected_state_names = st.multiselect(
+            "State Name",
+            options=state_name_options,
+            key=state_filter_key,
+            help=(
+                "Display filter only. It applies to fleet/vessel KPIs, errors, charts, "
+                "exports, and the Captain / Chief Engineer message without rerunning validation."
+            ),
+        )
+else:
+    selected_state_names = []
+    with st.sidebar.expander("State Name filter", expanded=False):
+        st.info("No State Name values were found in the validated source.")
+
+if state_name_options:
+    errors_dated = apply_state_name_filter(errors_dated_all, selected_state_names)
+    checked_rows_dated = apply_state_name_filter(checked_rows_dated_all, selected_state_names)
+else:
+    errors_dated = errors_dated_all.copy()
+    checked_rows_dated = checked_rows_dated_all.copy()
+
 recent_errors = errors_dated.copy()
 data_window_caption = get_data_window_caption(checked_rows_dated, errors_dated)
 
@@ -1146,6 +1199,32 @@ if vessel_options:
 else:
     vessel_summary = pd.DataFrame()
 
+# Build a fleet-level summary from the state-filtered all-fleets view. This is
+# intentionally calculated before the vessel selection so the fleet chart remains
+# a true fleet comparison even when a specific vessel is selected afterwards.
+if selected_fleet == "All fleets" and not vessel_summary.empty and "Fleet" in vessel_summary.columns:
+    fleet_summary = (
+        vessel_summary.groupby("Fleet", dropna=False)
+        .agg(
+            vessels=("Vessel", "nunique"),
+            report_rows=("report_rows", "sum"),
+            rows_with_errors=("rows_with_errors", "sum"),
+            rows_ok=("rows_ok", "sum"),
+            total_errors=("total_errors", "sum"),
+            high_severity_errors=("high_severity_errors", "sum"),
+        )
+        .reset_index()
+    )
+    fleet_summary["error_row_rate"] = (
+        fleet_summary["rows_with_errors"] / fleet_summary["report_rows"].replace(0, pd.NA)
+    )
+    fleet_summary = fleet_summary.sort_values(
+        ["total_errors", "high_severity_errors", "error_row_rate"],
+        ascending=[False, False, False],
+    )
+else:
+    fleet_summary = pd.DataFrame()
+
 # Apply the vessel filter after the fleet filter. All dashboard tabs and exports
 # below use these scoped dataframes.
 errors_scope = apply_vessel_filter(errors_fleet_scope, selected_vessel)
@@ -1187,7 +1266,11 @@ cols[4].metric("Total errors", total_errors)
 cols[5].metric("Error row rate", f"{error_rate:.1%}")
 
 selected_fleet_display = selected_fleet if selected_fleet == "All fleets" else format_fleet_label(selected_fleet)
-st.caption(f"Fleet: {selected_fleet_display} | Vessel: {selected_vessel} | {data_window_caption}")
+state_display = ", ".join(selected_state_names) if selected_state_names else "None"
+st.caption(
+    f"State Name: {state_display} | Fleet: {selected_fleet_display} | "
+    f"Vessel: {selected_vessel} | {data_window_caption}"
+)
 
 # -----------------------------------------------------------------------------
 # Tabs
@@ -1213,6 +1296,34 @@ with fleet_tab:
             display_summary["Fleet"] = display_summary["Fleet"].map(format_fleet_label)
         display_summary["error_row_rate"] = display_summary["error_row_rate"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
         st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+        if selected_fleet == "All fleets" and not fleet_summary.empty:
+            st.subheader("Top fleets by total errors")
+            fleet_chart_data = fleet_summary.copy()
+            fleet_chart_data["Fleet label"] = fleet_chart_data["Fleet"].map(format_fleet_label)
+            fleet_chart_data = fleet_chart_data.sort_values("total_errors", ascending=False).head(15)
+            fleet_chart = (
+                alt.Chart(fleet_chart_data)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        "Fleet label:N",
+                        sort=alt.SortField(field="total_errors", order="descending"),
+                        title="Fleet",
+                        axis=alt.Axis(labelAngle=-45),
+                    ),
+                    y=alt.Y("total_errors:Q", title="Total errors"),
+                    tooltip=[
+                        alt.Tooltip("Fleet label:N", title="Fleet"),
+                        alt.Tooltip("total_errors:Q", title="Total errors"),
+                        alt.Tooltip("vessels:Q", title="Vessels"),
+                        alt.Tooltip("rows_with_errors:Q", title="Rows with errors"),
+                        alt.Tooltip("high_severity_errors:Q", title="High severity errors"),
+                    ],
+                )
+                .properties(height=360)
+            )
+            st.altair_chart(fleet_chart, use_container_width=True)
 
         st.subheader("Top vessels by total errors")
         st.bar_chart(vessel_summary.sort_values("total_errors", ascending=False).head(10).set_index("Vessel")["total_errors"])
