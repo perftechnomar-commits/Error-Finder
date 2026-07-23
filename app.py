@@ -1326,7 +1326,38 @@ with fleet_tab:
             st.altair_chart(fleet_chart, use_container_width=True)
 
         st.subheader("Top vessels by total errors")
-        st.bar_chart(vessel_summary.sort_values("total_errors", ascending=False).head(10).set_index("Vessel")["total_errors"])
+        top_vessels_chart_df = (
+            vessel_summary.sort_values(
+                ["total_errors", "Vessel"],
+                ascending=[False, True],
+            )
+            .head(10)
+            .copy()
+        )
+        top_vessels_chart_df["Vessel"] = top_vessels_chart_df["Vessel"].astype(str)
+
+        vessel_chart = (
+            alt.Chart(top_vessels_chart_df)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "Vessel:N",
+                    sort=alt.SortField(field="total_errors", order="descending"),
+                    title="Vessel",
+                    axis=alt.Axis(labelAngle=-55),
+                ),
+                y=alt.Y("total_errors:Q", title="Total errors"),
+                tooltip=[
+                    alt.Tooltip("Vessel:N", title="Vessel"),
+                    alt.Tooltip("total_errors:Q", title="Total errors"),
+                    alt.Tooltip("report_rows:Q", title="Report rows"),
+                    alt.Tooltip("rows_with_errors:Q", title="Rows with errors"),
+                    alt.Tooltip("high_severity_errors:Q", title="High severity errors"),
+                ],
+            )
+            .properties(height=360)
+        )
+        st.altair_chart(vessel_chart, use_container_width=True)
 
 with main_tab:
     st.subheader("Errors")
