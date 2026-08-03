@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from io import BytesIO
 import hashlib
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -9,6 +11,8 @@ import streamlit as st
 
 from api_source import MarorkaSourceError, build_department_uploaded_file
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
+
+APP_TIME_ZONE = ZoneInfo("Europe/Athens")
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -18,6 +22,27 @@ st.title("Noon Report Checker")
 # -----------------------------------------------------------------------------
 # General helpers
 # -----------------------------------------------------------------------------
+
+def get_daily_api_refresh_key() -> str:
+    """Return the Athens calendar date used as the automatic API cache key."""
+    return datetime.now(APP_TIME_ZONE).strftime("%Y-%m-%d")
+
+
+def format_api_pull_timestamp(value: object) -> str:
+    """Format the successful API pull timestamp in Athens local time."""
+    if value is None:
+        return "Unavailable"
+
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return "Unavailable"
+
+    python_timestamp = timestamp.to_pydatetime()
+    if python_timestamp.tzinfo is None:
+        python_timestamp = python_timestamp.replace(tzinfo=timezone.utc)
+
+    return python_timestamp.astimezone(APP_TIME_ZONE).strftime("%d/%m/%Y %H:%M:%S")
+
 
 def parse_report_datetime(series: pd.Series) -> pd.Series:
     """Parse report datetimes robustly for filtering and KPI charts."""
@@ -886,19 +911,36 @@ source_mode = st.radio(
 
 uploaded_files = []
 
+# The date part forces one fresh API pull on the first app execution of each
+# Athens calendar day. The counter changes only when Reload API is pressed.
 if "auto_source_refresh_token" not in st.session_state:
     st.session_state["auto_source_refresh_token"] = 0
 
 if source_mode == "API source":
-    reload_col, _ = st.columns([1, 4])
-    if reload_col.button("Reload API", use_container_width=True):
+    daily_refresh_key = get_daily_api_refresh_key()
+    reload_col, last_pull_col = st.columns([1, 4])
+    last_pull_placeholder = last_pull_col.empty()
+
+    if reload_col.button(
+        "Reload API",
+        use_container_width=True,
+        help="Force a new Marorka API pull now. Normally this is unnecessary because the source refreshes automatically once per Athens calendar day.",
+    ):
         st.session_state["auto_source_refresh_token"] += 1
 
+    refresh_token = (
+        f"{daily_refresh_key}:"
+        f"{st.session_state['auto_source_refresh_token']}"
+    )
+
     try:
-        api_file, api_result = build_department_uploaded_file(
-            st.session_state["auto_source_refresh_token"]
-        )
+        api_file, api_result = build_department_uploaded_file(refresh_token)
         uploaded_files = [api_file]
+
+        last_pull_placeholder.caption(
+            f"Last API pull: {format_api_pull_timestamp(api_result.pulled_at_utc)} "
+            "(Athens time)"
+        )
 
         last_included_date = api_result.end_date_exclusive - pd.Timedelta(days=1)
         st.caption(
@@ -906,7 +948,8 @@ if source_mode == "API source":
             f"{api_result.report_rows:,} report row(s) from "
             f"{api_result.start_date:%d/%m/%Y} to "
             f"{last_included_date:%d/%m/%Y} "
-            f"({api_result.raw_rows:,} raw tag row(s))."
+            f"({api_result.raw_rows:,} raw tag row(s)). "
+            "Automatic refresh: first app execution of each Athens calendar day."
         )
     except MarorkaSourceError as exc:
         st.error(f"Department API source could not be loaded: {exc}")
