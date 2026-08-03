@@ -7,7 +7,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from marorka_api_source import MarorkaSourceError, build_department_uploaded_file
+from api_source import MarorkaSourceError, build_department_uploaded_file
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
