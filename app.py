@@ -574,7 +574,7 @@ def build_captain_message_df(errors_df: pd.DataFrame, selected_vessel_name: str 
 # -----------------------------------------------------------------------------
 
 # The API connection and the translated All vessels.xlsx Power Query logic live
-# in marorka_api_source.py. That module returns an uploaded-file-like in-memory
+# in api_source.py. That module returns an uploaded-file-like in-memory
 # workbook with a worksheet named "Table", so the existing validator pipeline
 # remains unchanged.
 
