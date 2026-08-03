@@ -878,7 +878,7 @@ with st.sidebar:
 
 source_mode = st.radio(
     "Data source",
-    ["API source", "Manual upload"],
+    ["Department auto source", "Manual upload"],
     index=0,
     horizontal=True,
     label_visibility="collapsed",
