@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from io import BytesIO
 import hashlib
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import requests
 import altair as alt
 import pandas as pd
 import streamlit as st
 
+from marorka_api_source import MarorkaSourceError, build_department_uploaded_file
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "AUTO_SOURCE_FLEET_STATE_FILTER_FLEET_CHART_2026_07_23"
+APP_BUILD = "MARORKA_API_SOURCE_FLEET_STATE_FILTER_2026_08_03"
 
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
@@ -573,63 +572,13 @@ def build_captain_message_df(errors_df: pd.DataFrame, selected_vessel_name: str 
 
 
 # -----------------------------------------------------------------------------
-# Department auto-source helpers
+# Department API source
 # -----------------------------------------------------------------------------
 
-class MemoryUploadedFile:
-    """Small uploaded-file-like wrapper so the existing validator can read auto-source bytes."""
-
-    def __init__(self, name: str, data: bytes):
-        self.name = name
-        self._data = data
-
-    def getvalue(self) -> bytes:
-        return self._data
-
-
-def make_sharepoint_download_url(url: str) -> str:
-    """Convert a SharePoint/OneDrive web-view URL into a best-effort download URL."""
-    parts = urlsplit(url.strip())
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.pop("web", None)
-    query["download"] = "1"
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_auto_source_file(source_url: str, refresh_token: int = 0) -> bytes:
-    """Download the department Excel source. refresh_token is used to force cache refresh."""
-    del refresh_token
-
-    if not source_url or not source_url.strip():
-        raise ValueError("AUTO_SOURCE_URL is missing from Streamlit secrets.")
-
-    download_url = make_sharepoint_download_url(source_url)
-    response = requests.get(
-        download_url,
-        timeout=90,
-        allow_redirects=True,
-        headers={
-            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*",
-            "User-Agent": "Mozilla/5.0",
-        },
-    )
-    response.raise_for_status()
-
-    content = response.content
-    content_type = response.headers.get("Content-Type", "")
-
-    # xlsx/xlsm files are ZIP containers and normally start with PK.
-    # If SharePoint returns a login page/HTML, validation would fail later with a cryptic error.
-    if not content.startswith(b"PK"):
-        preview = content[:160].decode("utf-8", errors="ignore").replace("\n", " ").strip()
-        raise ValueError(
-            "The auto source did not return a downloadable Excel file. "
-            "It may require SharePoint login, or the link is not a direct/anonymous download link. "
-            f"Content-Type: {content_type}. Preview: {preview}"
-        )
-
-    return content
+# The API connection and the translated All vessels.xlsx Power Query logic live
+# in marorka_api_source.py. That module returns an uploaded-file-like in-memory
+# workbook with a worksheet named "Table", so the existing validator pipeline
+# remains unchanged.
 
 
 # -----------------------------------------------------------------------------
@@ -943,22 +892,37 @@ if "auto_source_refresh_token" not in st.session_state:
     st.session_state["auto_source_refresh_token"] = 0
 
 if source_mode == "Department auto source":
-    auto_source_url = st.secrets.get("AUTO_SOURCE_URL", "")
-    auto_source_file_name = st.secrets.get("AUTO_SOURCE_FILE_NAME", "All vessels.xlsx")
-
     reload_col, _ = st.columns([1, 4])
-    if reload_col.button("Reload source file", use_container_width=True):
+    if reload_col.button("Reload API source", use_container_width=True):
         st.session_state["auto_source_refresh_token"] += 1
 
     try:
-        auto_payload = fetch_auto_source_file(
-            auto_source_url,
-            st.session_state["auto_source_refresh_token"],
+        api_file, api_result = build_department_uploaded_file(
+            st.session_state["auto_source_refresh_token"]
         )
-        uploaded_files = [MemoryUploadedFile(auto_source_file_name, auto_payload)]
-    except Exception as exc:  # noqa: BLE001 - user-facing source error
-        st.error(f"Department auto source could not be loaded: {exc}")
-        st.info("Switch to Manual upload as backup, or update AUTO_SOURCE_URL in Streamlit Secrets.")
+        uploaded_files = [api_file]
+
+        last_included_date = api_result.end_date_exclusive - pd.Timedelta(days=1)
+        st.caption(
+            "Marorka API source loaded: "
+            f"{api_result.report_rows:,} report row(s) from "
+            f"{api_result.start_date:%d/%m/%Y} to "
+            f"{last_included_date:%d/%m/%Y} "
+            f"({api_result.raw_rows:,} raw tag row(s))."
+        )
+    except MarorkaSourceError as exc:
+        st.error(f"Department API source could not be loaded: {exc}")
+        st.info(
+            "Switch to Manual upload as backup, or check the MARORKA_* values "
+            "in Streamlit Secrets."
+        )
+        st.stop()
+    except Exception as exc:  # noqa: BLE001 - keep the UI readable for unexpected API errors
+        st.error(f"Department API source could not be loaded: {exc}")
+        st.info(
+            "Switch to Manual upload as backup. Also verify the API credentials, "
+            "endpoint, and current Marorka tag schema."
+        )
         st.stop()
 
 else:
