@@ -10,8 +10,6 @@ import streamlit as st
 from marorka_api_source import MarorkaSourceError, build_department_uploaded_file
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
-APP_BUILD = "MARORKA_API_SOURCE_FLEET_STATE_FILTER_2026_08_03"
-
 st.set_page_config(page_title="Noon Report Checker", page_icon="✅", layout="wide")
 
 st.title("Noon Report Checker")
