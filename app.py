@@ -878,7 +878,7 @@ with st.sidebar:
 
 source_mode = st.radio(
     "Data source",
-    ["Department auto source", "Manual upload"],
+    ["API source", "Manual upload"],
     index=0,
     horizontal=True,
     label_visibility="collapsed",
@@ -889,9 +889,9 @@ uploaded_files = []
 if "auto_source_refresh_token" not in st.session_state:
     st.session_state["auto_source_refresh_token"] = 0
 
-if source_mode == "Department auto source":
+if source_mode == "API source":
     reload_col, _ = st.columns([1, 4])
-    if reload_col.button("Reload API source", use_container_width=True):
+    if reload_col.button("Reload API", use_container_width=True):
         st.session_state["auto_source_refresh_token"] += 1
 
     try:
