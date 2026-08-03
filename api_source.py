@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 import json
 import os
 from typing import Any, Mapping
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -22,7 +23,8 @@ DEFAULT_ENDPOINT = "https://online.marorka.com/Odata/v1/ODataService.svc/ReportD
 DEFAULT_LOOKBACK_DAYS = 5
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_PAGES = 1000
-DEFAULT_CACHE_TTL_SECONDS = 600
+DEFAULT_CACHE_TTL_SECONDS = 172800  # 48 hours; the daily cache key controls refresh cadence.
+DEFAULT_TIME_ZONE = ZoneInfo("Europe/Athens")
 
 EXCLUDED_REPORT_TYPES = {"Intake Report", "Fuel Change Report"}
 
@@ -296,6 +298,7 @@ class DepartmentApiResult:
     report_rows: int
     start_date: date
     end_date_exclusive: date
+    pulled_at_utc: datetime
 
 
 def _request_auth(config: MarorkaApiConfig) -> Any:
@@ -353,7 +356,7 @@ def fetch_reportdata_rows(
     session: requests.Session | None = None,
 ) -> tuple[list[dict[str, Any]], date, date]:
     """Fetch the same dynamic window as the Power Query: today-5 to tomorrow."""
-    today = today or date.today()
+    today = today or datetime.now(DEFAULT_TIME_ZONE).date()
     start_date = today - timedelta(days=config.lookback_days)
     end_date_exclusive = today + timedelta(days=1)
 
@@ -653,6 +656,7 @@ def build_department_api_result(
         report_rows=len(transformed),
         start_date=start_date,
         end_date_exclusive=end_date_exclusive,
+        pulled_at_utc=datetime.now(timezone.utc),
     )
 
 
@@ -665,15 +669,16 @@ def _streamlit_secrets_mapping() -> Mapping[str, Any]:
         return os.environ
 
 
-def _uncached_streamlit_result(refresh_token: int = 0) -> DepartmentApiResult:
+def _uncached_streamlit_result(refresh_token: str | int = 0) -> DepartmentApiResult:
     del refresh_token  # cache-busting input only
     config = MarorkaApiConfig.from_mapping(_streamlit_secrets_mapping())
     return build_department_api_result(config)
 
 
 if st is not None:
-    # TTL matches the old department file cache.  The Reload button increments the
-    # refresh token and immediately bypasses the cached result.
+    # The app supplies an Athens-date cache key, so the first execution on a new
+    # calendar day performs one fresh pull. A 48-hour TTL prevents repeat pulls
+    # during the same day while allowing old daily cache entries to expire.
     fetch_department_api_result = st.cache_data(
         ttl=DEFAULT_CACHE_TTL_SECONDS,
         show_spinner=False,
@@ -682,7 +687,7 @@ else:  # pragma: no cover
     fetch_department_api_result = _uncached_streamlit_result
 
 
-def build_department_uploaded_file(refresh_token: int = 0) -> tuple[MemoryUploadedFile, DepartmentApiResult]:
+def build_department_uploaded_file(refresh_token: str | int = 0) -> tuple[MemoryUploadedFile, DepartmentApiResult]:
     result = fetch_department_api_result(refresh_token)
     file_name = (
         f"API_All_vessels_{result.start_date:%Y%m%d}_"
