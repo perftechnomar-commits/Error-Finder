@@ -1,16 +1,5 @@
 from __future__ import annotations
 
-"""Patch the existing validator app without changing the rest of its UI/logic.
-
-Usage:
-    python apply_department_api_patch.py app.py
-
-The script creates ``app.before_api_source_patch.py`` first.  It then:
-1. adds the marorka_api_source import;
-2. replaces only the Department auto source branch;
-3. leaves Manual upload and the complete validation/dashboard code untouched.
-"""
-
 from pathlib import Path
 import re
 import shutil
