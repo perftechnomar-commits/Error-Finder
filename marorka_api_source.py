@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-"""Marorka ReportData -> All vessels.xlsx compatible dataframe.
-
-This module reproduces the Power Query logic used by the noon-report validator,
-but runs entirely in Python.  The Streamlit app can therefore keep its existing
-Excel-validation pipeline: the API dataframe is written to an in-memory workbook
-with a ``Table`` worksheet and wrapped as an uploaded-file-like object.
-"""
-
 from dataclasses import dataclass
 from datetime import date, timedelta
 from io import BytesIO
