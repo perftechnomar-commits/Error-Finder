@@ -9,7 +9,12 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from api_source import MarorkaSourceError, build_department_uploaded_file
+from api_source import (
+    MarorkaSourceError,
+    build_department_uploaded_file,
+    get_department_api_refresh_generation,
+    request_department_api_refresh,
+)
 from validator import DEFAULT_CONFIG, RULES, combine_results, results_to_excel_bytes, validate_excel_file
 
 APP_TIME_ZONE = ZoneInfo("Europe/Athens")
@@ -23,9 +28,17 @@ st.title("Noon Report Checker")
 # General helpers
 # -----------------------------------------------------------------------------
 
-def get_daily_api_refresh_key() -> str:
-    """Return the Athens calendar date used as the automatic API cache key."""
-    return datetime.now(APP_TIME_ZONE).strftime("%Y-%m-%d")
+def get_scheduled_refresh_request() -> str:
+    """Return the scheduler refresh token from the URL, if present.
+
+    Use ?scheduled_refresh=<run-id>. A unique run-id (for example a timestamp)
+    is recommended. The app handles a given token only once per Streamlit session
+    so widget reruns do not repeatedly hit the API.
+    """
+    value = st.query_params.get("scheduled_refresh", "")
+    if isinstance(value, list):
+        value = value[-1] if value else ""
+    return str(value).strip()
 
 
 def format_api_pull_timestamp(value: object) -> str:
@@ -910,27 +923,37 @@ source_mode = st.radio(
 
 uploaded_files = []
 
-# The date part forces one fresh API pull on the first app execution of each
-# Athens calendar day. The counter changes only when Reload API is pressed.
-if "auto_source_refresh_token" not in st.session_state:
-    st.session_state["auto_source_refresh_token"] = 0
-
 if source_mode == "API source":
-    daily_refresh_key = get_daily_api_refresh_key()
     reload_col, last_pull_col = st.columns([1, 4])
     last_pull_placeholder = last_pull_col.empty()
+
+    scheduled_refresh_request = get_scheduled_refresh_request()
+    scheduler_refresh_fired = False
+
+    # A scheduler URL should contain ?scheduled_refresh=<run-id>. The same token
+    # is handled only once in the current Streamlit session, preventing normal
+    # widget reruns from repeatedly refreshing Marorka. A new scheduler session
+    # (or a new run-id) advances the shared generation and forces one fresh pull.
+    if scheduled_refresh_request:
+        last_handled_request = st.session_state.get("last_scheduled_refresh_request")
+        if last_handled_request != scheduled_refresh_request:
+            request_department_api_refresh()
+            st.session_state["last_scheduled_refresh_request"] = scheduled_refresh_request
+            scheduler_refresh_fired = True
+    else:
+        # Reset the per-session guard when the scheduler parameter is absent so
+        # the same literal token can be used again after leaving/re-entering it.
+        st.session_state.pop("last_scheduled_refresh_request", None)
 
     if reload_col.button(
         "Reload API",
         use_container_width=True,
-        help="Force a new Marorka API pull now. Normally this is unnecessary because the source refreshes automatically once per Athens calendar day.",
+        help="Force one fresh Marorka API pull now. Normal dashboard interactions continue using the cached latest pull.",
     ):
-        st.session_state["auto_source_refresh_token"] += 1
+        request_department_api_refresh()
 
-    refresh_token = (
-        f"{daily_refresh_key}:"
-        f"{st.session_state['auto_source_refresh_token']}"
-    )
+    refresh_generation = get_department_api_refresh_generation()
+    refresh_token = f"generation:{refresh_generation}"
 
     try:
         api_file, api_result = build_department_uploaded_file(refresh_token)
@@ -942,13 +965,18 @@ if source_mode == "API source":
         )
 
         last_included_date = api_result.end_date_exclusive - pd.Timedelta(days=1)
+        refresh_mode_text = (
+            "Scheduler refresh completed."
+            if scheduler_refresh_fired
+            else "API cache is reused until the scheduler or Reload API requests a fresh pull."
+        )
         st.caption(
             "Marorka API source loaded: "
             f"{api_result.report_rows:,} report row(s) from "
             f"{api_result.start_date:%d/%m/%Y} to "
             f"{last_included_date:%d/%m/%Y} "
             f"({api_result.raw_rows:,} raw tag row(s)). "
-            "Automatic refresh: first app execution of each Athens calendar day."
+            f"{refresh_mode_text}"
         )
     except MarorkaSourceError as exc:
         st.error(f"Department API source could not be loaded: {exc}")
