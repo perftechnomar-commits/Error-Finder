@@ -1487,7 +1487,11 @@ with kpi_tab:
 
 with rows_tab:
     st.subheader("Checked rows")
-    st.dataframe(checked_rows_scope, use_container_width=True, hide_index=True)
+    checked_rows_display = checked_rows_scope.drop(
+        columns=[col for col in ["file_name", "sheet_name", "excel_row"] if col in checked_rows_scope.columns],
+        errors="ignore",
+    )
+    st.dataframe(checked_rows_display, use_container_width=True, hide_index=True)
 
     if not skipped_rules.empty:
         st.warning("Some rules were skipped because required columns were not found in at least one file.")
