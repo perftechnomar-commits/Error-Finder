@@ -1450,7 +1450,35 @@ with kpi_tab:
 
     if not by_rule_scope.empty:
         st.subheader("Top error categories")
-        st.bar_chart(by_rule_scope.sort_values("count", ascending=False).head(10).set_index("issue_type")["count"])
+        top_error_categories_df = (
+            by_rule_scope.sort_values(
+                ["count", "issue_type"],
+                ascending=[False, True],
+            )
+            .head(10)
+            .copy()
+        )
+        top_error_categories_df["issue_type"] = top_error_categories_df["issue_type"].astype(str)
+
+        error_category_chart = (
+            alt.Chart(top_error_categories_df)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "issue_type:N",
+                    sort=alt.SortField(field="count", order="descending"),
+                    title="Error category",
+                    axis=alt.Axis(labelAngle=-55),
+                ),
+                y=alt.Y("count:Q", title="Total errors"),
+                tooltip=[
+                    alt.Tooltip("issue_type:N", title="Error category"),
+                    alt.Tooltip("count:Q", title="Total errors"),
+                ],
+            )
+            .properties(height=360)
+        )
+        st.altair_chart(error_category_chart, use_container_width=True)
 
     if not daily_kpis_scope.empty:
         st.subheader("Daily validation trend")
