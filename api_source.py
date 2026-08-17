@@ -23,7 +23,7 @@ DEFAULT_ENDPOINT = "https://online.marorka.com/Odata/v1/ODataService.svc/ReportD
 DEFAULT_LOOKBACK_DAYS = 5
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_PAGES = 1000
-DEFAULT_CACHE_TTL_SECONDS = 172800  # 48 hours; the daily cache key controls refresh cadence.
+DEFAULT_CACHE_TTL_SECONDS = 172800  # 48-hour safety expiry; refresh generation controls cadence.
 DEFAULT_TIME_ZONE = ZoneInfo("Europe/Athens")
 
 EXCLUDED_REPORT_TYPES = {"Intake Report", "Fuel Change Report"}
@@ -676,15 +676,46 @@ def _uncached_streamlit_result(refresh_token: str | int = 0) -> DepartmentApiRes
 
 
 if st is not None:
-    # The app supplies an Athens-date cache key, so the first execution on a new
-    # calendar day performs one fresh pull. A 48-hour TTL prevents repeat pulls
-    # during the same day while allowing old daily cache entries to expire.
+    # API results are cached so ordinary Streamlit reruns (filters, tabs, selectboxes)
+    # do not hit Marorka again. The app changes the shared refresh generation only
+    # when an explicit API refresh is requested (scheduler or Reload API button).
     fetch_department_api_result = st.cache_data(
         ttl=DEFAULT_CACHE_TTL_SECONDS,
         show_spinner=False,
     )(_uncached_streamlit_result)
+
+    @st.cache_resource(show_spinner=False)
+    def _department_api_refresh_state() -> dict[str, int]:
+        # cache_resource is shared by all sessions in the running Streamlit process.
+        return {"generation": 0}
 else:  # pragma: no cover
     fetch_department_api_result = _uncached_streamlit_result
+    _NON_STREAMLIT_REFRESH_STATE = {"generation": 0}
+
+    def _department_api_refresh_state() -> dict[str, int]:
+        return _NON_STREAMLIT_REFRESH_STATE
+
+
+def get_department_api_refresh_generation() -> int:
+    """Return the shared API refresh generation used as the cache key."""
+    return int(_department_api_refresh_state()["generation"])
+
+
+def request_department_api_refresh() -> int:
+    """Invalidate the cached API result and advance the shared refresh generation.
+
+    Call this exactly when a real source refresh is required (for example, from a
+    scheduler-triggered Streamlit session or the manual Reload API button). Normal
+    widget reruns should only read the current generation.
+    """
+    state = _department_api_refresh_state()
+    state["generation"] = int(state.get("generation", 0)) + 1
+
+    clear_method = getattr(fetch_department_api_result, "clear", None)
+    if callable(clear_method):
+        clear_method()
+
+    return int(state["generation"])
 
 
 def build_department_uploaded_file(refresh_token: str | int = 0) -> tuple[MemoryUploadedFile, DepartmentApiResult]:
