@@ -28,17 +28,34 @@ st.title("Noon Report Checker")
 # General helpers
 # -----------------------------------------------------------------------------
 
-def get_scheduled_refresh_request() -> str:
-    """Return the scheduler refresh token from the URL, if present.
-
-    Use ?scheduled_refresh=<run-id>. A unique run-id (for example a timestamp)
-    is recommended. The app handles a given token only once per Streamlit session
-    so widget reruns do not repeatedly hit the API.
-    """
-    value = st.query_params.get("scheduled_refresh", "")
+def get_query_param_value(name: str) -> str:
+    """Return one query-parameter value as a stripped string."""
+    value = st.query_params.get(name, "")
     if isinstance(value, list):
         value = value[-1] if value else ""
     return str(value).strip()
+
+
+def get_scheduled_refresh_request() -> str:
+    """Return an optional scheduler refresh token from the URL.
+
+    This remains supported for callers that use ?scheduled_refresh=<run-id>.
+    """
+    return get_query_param_value("scheduled_refresh")
+
+
+def is_forced_warmup_refresh_request() -> bool:
+    """True for the existing Task Scheduler URL: ?warmup=1&force=1&token=... .
+
+    The force flag is treated as a one-shot API refresh request. After it is
+    consumed, query parameters are cleared so normal Streamlit widget reruns do
+    not repeatedly pull Marorka while the browser remains open.
+    """
+    truthy = {"1", "true", "yes", "on"}
+    return (
+        get_query_param_value("warmup").casefold() in truthy
+        and get_query_param_value("force").casefold() in truthy
+    )
 
 
 def format_api_pull_timestamp(value: object) -> str:
@@ -928,21 +945,30 @@ if source_mode == "API source":
     last_pull_placeholder = last_pull_col.empty()
 
     scheduled_refresh_request = get_scheduled_refresh_request()
+    forced_warmup_refresh = is_forced_warmup_refresh_request()
     scheduler_refresh_fired = False
 
-    # A scheduler URL should contain ?scheduled_refresh=<run-id>. The same token
-    # is handled only once in the current Streamlit session, preventing normal
-    # widget reruns from repeatedly refreshing Marorka. A new scheduler session
-    # (or a new run-id) advances the shared generation and forces one fresh pull.
-    if scheduled_refresh_request:
+    # Existing Task Scheduler URL:
+    #   ?warmup=1&force=1&token=warmup-error-finder
+    # Treat force=1 as a one-shot command. Clear the query parameters immediately
+    # after advancing the shared generation so later widget reruns in this same
+    # browser session reuse the newly pulled cache instead of pulling again.
+    if forced_warmup_refresh:
+        request_department_api_refresh()
+        scheduler_refresh_fired = True
+        st.session_state.pop("last_scheduled_refresh_request", None)
+        st.query_params.clear()
+
+    # Alternative scheduler mode:
+    #   ?scheduled_refresh=<unique-run-id>
+    # A token is handled only once per Streamlit session.
+    elif scheduled_refresh_request:
         last_handled_request = st.session_state.get("last_scheduled_refresh_request")
         if last_handled_request != scheduled_refresh_request:
             request_department_api_refresh()
             st.session_state["last_scheduled_refresh_request"] = scheduled_refresh_request
             scheduler_refresh_fired = True
     else:
-        # Reset the per-session guard when the scheduler parameter is absent so
-        # the same literal token can be used again after leaving/re-entering it.
         st.session_state.pop("last_scheduled_refresh_request", None)
 
     if reload_col.button(
